@@ -15,7 +15,7 @@ import requests
 # -----------------------
 # Versione script (per verifica nei log)
 # -----------------------
-SCRIPT_VERSION = "2025-10-19-mlsd-v3"
+SCRIPT_VERSION = "2025-10-19-mlsd-v4-sku-first-no-suffix"
 
 # -----------------------
 # Config & logging
@@ -49,8 +49,8 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 # Estensioni consentite
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
-# Regex filename: SKU_index (index numerico)
-FILENAME_RE = re.compile(r"^(?P<sku>.+?)_(?P<idx>\d+)$", re.IGNORECASE)
+# Regex filename: accetta "SKU" o "SKU_#"
+FILENAME_RE = re.compile(r"^(?P<sku>.+?)(?:_(?P<idx>\d+))?$", re.IGNORECASE)
 
 
 # -----------------------
@@ -141,8 +141,7 @@ def list_existing_images(product_id: str) -> Dict[str, dict]:
     """
     Restituisce dict alt_text -> image_dict per un prodotto,
     così evitiamo duplicati basati su alt (es. SKU_1, SKU_2, ...).
-
-    Nota: su API 2025-01 il campo `position` non esiste più.
+    (API 2025-01: campo 'position' non disponibile via GraphQL)
     """
     query = """
     query($id: ID!) {
@@ -303,6 +302,7 @@ def walk_ftp_files(ftp: FTP, base_dir: str) -> List[str]:
         except Exception:
             ftp = ftp_reconnect()
             ops_since_noop = 0
+
         entries = None
         for attempt in (1, 2):
             try:
@@ -318,6 +318,7 @@ def walk_ftp_files(ftp: FTP, base_dir: str) -> List[str]:
             except error_perm:
                 entries = None
                 break
+
         if entries is None:
             try:
                 names = ftp.nlst(current)
@@ -352,6 +353,7 @@ def walk_ftp_files(ftp: FTP, base_dir: str) -> List[str]:
                 else:
                     files.append(full_path)
             continue
+
         for name, facts in entries:
             if name in (".", ".."):
                 continue
@@ -375,22 +377,40 @@ def ftp_read_file(ftp: FTP, path: str) -> bytes:
 
 
 # -----------------------
-# Analisi dei file FTP
+# Analisi dei file FTP + parsing
 # -----------------------
 def parse_filename_strict(path: str):
+    """
+    Supporta:
+      - 'SKU.jpg'   -> idx=1
+      - 'SKU_2.jpg' -> idx=2
+    Scarta estensioni non valide e pattern non conformi.
+    """
     base = os.path.basename(path)
     name, ext = os.path.splitext(base)
     ext = ext.lower()
     if ext not in IMAGE_EXTS:
         return {"ok": False, "reason": "bad_ext"}
+
     m = FILENAME_RE.match(name)
     if not m:
         return {"ok": False, "reason": "bad_pattern"}
-    sku = m.group("sku").strip()
-    try:
-        idx = int(m.group("idx"))
-    except Exception:
+
+    sku = (m.group("sku") or "").strip()
+    if not sku:
         return {"ok": False, "reason": "bad_pattern"}
+
+    idx_str = m.group("idx")
+    if idx_str is None:
+        idx = 1
+    else:
+        try:
+            idx = int(idx_str)
+        except Exception:
+            return {"ok": False, "reason": "bad_pattern"}
+        if idx < 1:
+            return {"ok": False, "reason": "bad_pattern"}
+
     return {"ok": True, "sku": sku, "idx": idx}
 
 
@@ -431,7 +451,7 @@ def analyze_files(files: List[str], sku_map: Dict[str, Tuple[str, str]], max_exa
     LOG.info("  • File con estensione NON valida: %d", stats["bad_ext"])
     if stats["examples_bad_ext"]:
         LOG.info("    esempi bad_ext: %s", stats["examples_bad_ext"])
-    LOG.info("  • File con NOME non conforme (pattern SKU_#): %d", stats["bad_pattern"])
+    LOG.info("  • File con NOME non conforme (pattern SKU o SKU_#): %d", stats["bad_pattern"])
     if stats["examples_bad_pattern"]:
         LOG.info("    esempi bad_pattern: %s", stats["examples_bad_pattern"])
     LOG.info("  • File validi (pattern ok): %d", stats["ok_parse"])
@@ -444,18 +464,42 @@ def analyze_files(files: List[str], sku_map: Dict[str, Tuple[str, str]], max_exa
 
 
 # -----------------------
-# Core sync
+# Core sync (grouping con collisioni)
 # -----------------------
 def group_images_by_sku(file_paths: List[str]) -> Dict[str, List[Tuple[int, str]]]:
     groups: Dict[str, List[Tuple[int, str]]] = {}
+    first_choice: Dict[Tuple[str, int], str] = {}  # (sku, idx) -> path
+
     for path in file_paths:
         p = parse_filename_strict(path)
         if not p["ok"]:
             continue
         sku, idx = p["sku"], p["idx"]
+        key = (sku, idx)
+
+        if key not in first_choice:
+            first_choice[key] = path
+        else:
+            existing = first_choice[key]
+            base_new = os.path.splitext(os.path.basename(path))[0]
+            base_old = os.path.splitext(os.path.basename(existing))[0]
+            new_has_suffix = re.search(r"_(\d+)$", base_new) is not None
+            old_has_suffix = re.search(r"_(\d+)$", base_old) is not None
+
+            if idx == 1 and old_has_suffix and not new_has_suffix:
+                first_choice[key] = path
+                LOG.warning("Collisione su %s idx=1: preferita versione senza suffisso (%s) al posto di (%s)",
+                            sku, os.path.basename(path), os.path.basename(existing))
+            else:
+                LOG.warning("Collisione su %s idx=%d: mantengo %s, scarto %s",
+                            sku, idx, os.path.basename(existing), os.path.basename(path))
+
+    for (sku, idx), path in first_choice.items():
         groups.setdefault(sku, []).append((idx, path))
+
     for sku in groups:
         groups[sku].sort(key=lambda x: x[0])
+
     return groups
 
 
@@ -465,11 +509,13 @@ def sync():
     sku_map = build_sku_index()
     if not (FTP_HOST and FTP_USER and FTP_PASSWORD):
         raise SystemExit("Config mancante: FTP_HOST / FTP_USER / FTP_PASSWORD")
+
     ftp = connect_ftp()
     try:
         LOG.info("Scansione FTP da %s ...", FTP_BASE_DIR or "/")
         files = walk_ftp_files(ftp, FTP_BASE_DIR or "/")
-        LOG.info("Trovati %d file totali su FTP (escludendo '%s')", len(files), PUBLISHED_ROOT if MOVE_AFTER_UPLOAD else "N/A")
+        LOG.info("Trovati %d file totali su FTP (escludendo '%s')",
+                 len(files), PUBLISHED_ROOT if MOVE_AFTER_UPLOAD else "N/A")
         analyze_files(files, sku_map)
         groups = group_images_by_sku(files)
         LOG.info("Trovati %d SKU con immagini nel formato atteso", len(groups))
@@ -491,6 +537,7 @@ def sync():
                 skipped_unknown_sku += 1
                 LOG.warning("SKU non presente in Shopify, salto: %s", sku)
                 continue
+
             product_id, variant_id = sku_map[sku]
             try:
                 existing_by_alt = list_existing_images(product_id)
@@ -507,6 +554,7 @@ def sync():
                     LOG.info("  - già presente (alt=%s), salto", alt)
                     position_counter += 1
                     continue
+
                 try:
                     content = ftp_read_file(ftp, path)
                     attachment_b64 = base64.b64encode(content).decode("ascii")
@@ -518,8 +566,10 @@ def sync():
                         variant_id=variant_id if ALSO_ATTACH_TO_VARIANT else None
                     )
                     uploaded_count += 1
-                    LOG.info("  + caricato %s (pos=%d)%s", alt, position_counter, " [DRY RUN]" if DRY_RUN else "")
+                    LOG.info("  + caricato %s (pos=%d)%s",
+                             alt, position_counter, " [DRY RUN]" if DRY_RUN else "")
                     time.sleep(0.4)
+
                     if MOVE_AFTER_UPLOAD and not DRY_RUN:
                         rel = path[len(FTP_BASE_DIR):] if path.startswith(FTP_BASE_DIR) else path
                         rel = rel.lstrip("/")
@@ -529,7 +579,9 @@ def sync():
                             LOG.info("    ↪ spostato su %s", dst)
                         except Exception as me:
                             LOG.warning("    ⚠ impossibile spostare %s → %s: %s", path, dst, me)
+
                     position_counter += 1
+
                 except Exception as e:
                     errors += 1
                     LOG.error("  ! errore su %s: %s", path, e)
@@ -549,7 +601,7 @@ def sync():
 
 if __name__ == "__main__":
     LOG.info("Script version: %s", SCRIPT_VERSION)
-    LOG.info("Avvio sincronizzazione immagini FTP → Shopify (ordine _1, _2, ...)")
+    LOG.info("Avvio sincronizzazione immagini FTP → Shopify (ordine SKU, SKU_2, ...)")
     LOG.info("DRY_RUN=%s | ALSO_ATTACH_TO_VARIANT=%s | MOVE_AFTER_UPLOAD=%s | PUBLISHED_DIR=%s",
-             DRY_RUN, ALSO_ATTACH_TO_VARIIANT, MOVE_AFTER_UPLOAD, PUBLISHED_ROOT)
+             DRY_RUN, ALSO_ATTACH_TO_VARIANT, MOVE_AFTER_UPLOAD, PUBLISHED_ROOT)
     sync()
