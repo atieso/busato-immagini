@@ -1,9 +1,10 @@
 services:
-  - type: background
+  - type: cron
     name: sync-ftp-to-shopify
     runtime: python
     region: frankfurt
     plan: starter
+    schedule: "0 3 * * *"  # ogni giorno alle 03:00
     envVars:
       - key: SHOPIFY_STORE
         sync: false
