@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import io
 import re
@@ -25,7 +28,7 @@ SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-01")
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASSWORD = os.getenv("FTP_PASSWORD")
-FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/").rstrip("/")
+FTP_BASE_DIR = (os.getenv("FTP_BASE_DIR", "/") or "/").rstrip("/")
 
 FTP_USE_TLS = os.getenv("FTP_USE_TLS", "false").lower() == "true"
 
@@ -51,15 +54,15 @@ FILENAME_RE = re.compile(r"^(?P<sku>.+?)_(?P<idx>\d+)$", re.IGNORECASE)
 def to_numeric_id(gid: str) -> str:
     return gid.rsplit("/", 1)[-1]
 
+
 def ftp_path_join(*parts: str) -> str:
     clean = []
     for p in parts:
         if p is None:
             continue
-        p = p.strip()
+        p = str(p).strip().replace("\\", "/")
         if not p:
             continue
-        p = p.replace("\\", "/")
         clean.append(p.strip("/"))
     if not clean:
         return "/"
@@ -202,7 +205,17 @@ def connect_ftp() -> FTP:
     else:
         ftp = FTP(FTP_HOST)
         ftp.login(FTP_USER, FTP_PASSWORD)
+    try:
+        ftp.set_pasv(True)
+    except Exception:
+        pass
     return ftp
+
+
+def ftp_reconnect() -> FTP:
+    """Riconnette l'FTP usando le ENV correnti."""
+    LOG.info("Riconnessione FTP...")
+    return connect_ftp()
 
 
 def ftp_ensure_dir(ftp: FTP, path: str):
@@ -231,68 +244,162 @@ def ftp_move(ftp: FTP, src: str, dst: str):
     ftp.rename(src, dst)
 
 
+def ftp_mlsd_safe(ftp: FTP, path: str):
+    """
+    Itera su MLSD restituendo (name, facts) senza fare cwd.
+    Riprova una volta se il server chiude la connessione (EOFError).
+    """
+    # Prova API nativa mlsd (se il server la supporta)
+    try:
+        return list(ftp.mlsd(path, facts=["type", "size", "modify"]))
+    except AttributeError:
+        # ftplib >= 3.8 ha mlsd; se siamo qui, il server non supporta MLSD
+        pass
+    except EOFError:
+        raise
+    except error_perm:
+        # Server che rifiuta MLSD: delega al fallback
+        raise
+
+    # Fallback: usare "MLSD path" via retrlines e parsare manualmente
+    entries = []
+    ftp.retrlines(f"MLSD {path}", entries.append)
+    out = []
+    for line in entries:
+        # es.: "type=file;size=123;modify=20250101...; filename"
+        if ";" in line:
+            facts_part, name = line.rsplit(" ", 1)
+            facts = {}
+            for kv in facts_part.split(";"):
+                kv = kv.strip()
+                if not kv:
+                    continue
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    facts[k] = v
+            name = name.strip()
+            out.append((name, facts))
+        else:
+            out.append((line.strip(), {}))
+    return out
+
+
 def walk_ftp_files(ftp: FTP, base_dir: str) -> List[str]:
     """
-    Ritorna la lista dei file (path assoluti) sotto base_dir,
-    escludendo la cartella Pubblicate (se abilitata).
+    Scansione robusta usando MLSD (senza cambiare directory).
+    Esclude la cartella Pubblicate se MOVE_AFTER_UPLOAD=True.
+    Gestione retry su EOFError con riconnessione trasparente.
     """
-    files = []
-    exclude_prefix = PUBLISHED_ROOT + "/" if MOVE_AFTER_UPLOAD else None
+    base_dir = base_dir or "/"
+    base_dir = base_dir.rstrip("/") or "/"
 
-    def _is_excluded(path: str) -> bool:
-        if not exclude_prefix:
+    files: List[str] = []
+    exclude_root = PUBLISHED_ROOT if MOVE_AFTER_UPLOAD else None
+    exclude_prefix = (exclude_root + "/") if exclude_root else None
+
+    def is_excluded(path: str) -> bool:
+        if not exclude_root:
             return False
-        # escludi "/base/Published" e tutto ciò che ci sta sotto
-        return path == PUBLISHED_ROOT or path.startswith(exclude_prefix)
+        return path == exclude_root or path.startswith(exclude_prefix)
 
-    def _walk(cwd: str):
-        if _is_excluded(cwd):
-            return
+    stack = [base_dir]
+    ops_since_noop = 0
+    MAX_OPS_BEFORE_NOOP = 200  # keep-alive leggero
+
+    while stack:
+        current = stack.pop()
+        if is_excluded(current):
+            continue
+
+        # keep-alive NOOP periodico per evitare timeout silenziosi
         try:
-            entries = []
-            ftp.retrlines(f"MLSD {cwd}", entries.append)
-            # MLSD
-            names = []
-            for line in entries:
-                # Dopo i facts tipo "type=file;size=...; modify=...; filename"
-                if ";" in line:
-                    name = line.split(";")[-1].strip()
-                else:
-                    name = line.strip()
-                if name in (".", ".."):
-                    continue
-                names.append(name)
-            for name in names:
-                full_path = ftp_path_join(cwd, name)
-                if _is_excluded(full_path):
-                    continue
-                # prova a fare CWD per capire se è dir
+            ops_since_noop += 1
+            if ops_since_noop >= MAX_OPS_BEFORE_NOOP:
                 try:
-                    cwd_before = ftp.pwd()
-                    ftp.cwd(full_path)
-                    ftp.cwd(cwd_before)
-                    _walk(full_path)  # directory
-                except error_perm:
-                    files.append(full_path)  # file
-        except error_perm:
-            # Fallback LIST
-            listing = []
-            ftp.retrlines(f"LIST {cwd}", listing.append)
-            for line in listing:
-                parts = line.split()
-                if len(parts) < 9:
-                    continue
-                name = " ".join(parts[8:])
-                if name in (".", ".."):
-                    continue
-                full_path = ftp_path_join(cwd, name)
-                if line.lower().startswith("d"):
-                    _walk(full_path)
-                else:
-                    if not _is_excluded(full_path):
-                        files.append(full_path)
+                    ftp.voidcmd("NOOP")
+                except Exception:
+                    ftp = ftp_reconnect()
+                ops_since_noop = 0
+        except Exception:
+            ftp = ftp_reconnect()
+            ops_since_noop = 0
 
-    _walk(base_dir if base_dir else "/")
+        # MLSD con retry
+        entries = None
+        for attempt in (1, 2):
+            try:
+                entries = ftp_mlsd_safe(ftp, current)
+                break
+            except EOFError:
+                if attempt == 1:
+                    LOG.warning("Connessione FTP chiusa durante MLSD su %s: riconnessione...", current)
+                    ftp = ftp_reconnect()
+                    continue
+                else:
+                    raise
+            except error_perm:
+                # Server non supporta MLSD: fallback dopo il loop
+                entries = None
+                break
+
+        if entries is None:
+            # Fallback: usa NLST per nomi, poi LIST per capire se dir/file
+            try:
+                names = ftp.nlst(current)
+            except EOFError:
+                LOG.warning("Connessione FTP chiusa durante NLST su %s: riconnessione...", current)
+                ftp = ftp_reconnect()
+                names = ftp.nlst(current)
+
+            # Normalizza a path completi
+            norm_names = []
+            for n in names:
+                if not n:
+                    continue
+                if n.startswith(current.rstrip("/") + "/"):
+                    norm_names.append(n)
+                else:
+                    norm_names.append(ftp_path_join(current, os.path.basename(n)))
+
+            # Per ciascuno, prova LIST singola per capire se directory
+            for full_path in norm_names:
+                if is_excluded(full_path):
+                    continue
+                listing = []
+                try:
+                    ftp.retrlines(f"LIST {full_path}", listing.append)
+                except EOFError:
+                    LOG.warning("Connessione FTP chiusa durante LIST su %s: riconnessione...", full_path)
+                    ftp = ftp_reconnect()
+                    listing = []
+                    ftp.retrlines(f"LIST {full_path}", listing.append)
+                is_dir = False
+                if listing:
+                    first = listing[0].lower()
+                    if first.startswith("d"):
+                        is_dir = True
+                if is_dir:
+                    stack.append(full_path)
+                else:
+                    files.append(full_path)
+            continue
+
+        # Percorso MLSD con facts
+        for name, facts in entries:
+            if name in (".", ".."):
+                continue
+            full_path = ftp_path_join(current, name)
+            if is_excluded(full_path):
+                continue
+            ftype = (facts.get("type") or "").lower()
+            if ftype == "dir":
+                stack.append(full_path)
+            elif ftype == "file":
+                files.append(full_path)
+            else:
+                # alcuni server usano valori non standard; trattiamo come file
+                files.append(full_path)
+
     return files
 
 
@@ -309,9 +416,9 @@ def parse_filename(fname: str) -> Optional[Tuple[str, int]]:
     """
     Ritorna (sku, idx) se il filename (senza estensione) è nel formato SKU_idx
     """
-    name = os.path.splitext(os.path.basename(fname))[0]
-    ext = os.path.splitext(os.path.basename(fname))[1].lower()
-    if ext not in IMAGE_EXTS:
+    base = os.path.basename(fname)
+    name, ext = os.path.splitext(base)
+    if ext.lower() not in IMAGE_EXTS:
         return None
     m = FILENAME_RE.match(name)
     if not m:
@@ -389,7 +496,7 @@ def sync():
                     duplicated += 1
                     LOG.info("  - già presente (alt=%s), salto", alt)
                     position_counter += 1
-                    # opzionalmente potresti spostare comunque il file, ma è più sicuro non farlo
+                    # Non spostiamo i duplicati per sicurezza: evita falsi positivi
                     continue
 
                 try:
@@ -406,9 +513,10 @@ def sync():
                     LOG.info("  + caricato %s (pos=%d)%s",
                              alt, position_counter, " [DRY RUN]" if DRY_RUN else "")
                     time.sleep(0.4)  # rate limit safety
+
                     # Move after successful upload (if enabled & not dry run)
                     if MOVE_AFTER_UPLOAD and not DRY_RUN:
-                        # calcola path relativo a FTP_BASE_DIR per mantenere la struttura
+                        # mantieni struttura relativa rispetto alla base
                         rel = path[len(FTP_BASE_DIR):] if path.startswith(FTP_BASE_DIR) else path
                         rel = rel.lstrip("/")
                         dst = ftp_path_join(FTP_BASE_DIR, FTP_PUBLISHED_DIR, rel)
@@ -417,7 +525,9 @@ def sync():
                             LOG.info("    ↪ spostato su %s", dst)
                         except Exception as me:
                             LOG.warning("    ⚠ impossibile spostare %s → %s: %s", path, dst, me)
+
                     position_counter += 1
+
                 except Exception as e:
                     errors += 1
                     LOG.error("  ! errore su %s: %s", path, e)
