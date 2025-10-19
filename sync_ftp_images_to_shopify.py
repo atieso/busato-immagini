@@ -602,6 +602,8 @@ def sync():
 if __name__ == "__main__":
     LOG.info("Script version: %s", SCRIPT_VERSION)
     LOG.info("Avvio sincronizzazione immagini FTP → Shopify (ordine SKU, SKU_2, ...)")
-    LOG.info("DRY_RUN=%s | ALSO_ATTACH_TO_VARIANT=%s | MOVE_AFTER_UPLOAD=%s | PUBLISHED_DIR=%s",
-             DRY_RUN, ALSO_ATTACH_TO_VARIANT, MOVE_AFTER_UPLOAD, PUBLISHED_ROOT)
+    LOG.info(
+        "DRY_RUN=%s | ALSO_ATTACH_TO_VARIANT=%s | MOVE_AFTER_UPLOAD=%s | PUBLISHED_DIR=%s",
+        DRY_RUN, ALSO_ATTACH_TO_VARIANT, MOVE_AFTER_UPLOAD, PUBLISHED_ROOT
+    )
     sync()
