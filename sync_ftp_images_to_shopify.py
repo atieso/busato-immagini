@@ -141,6 +141,9 @@ def list_existing_images(product_id: str) -> Dict[str, dict]:
     """
     Restituisce dict alt_text -> image_dict per un prodotto,
     così evitiamo duplicati basati su alt (es. SKU_1, SKU_2, ...).
+
+    Nota: su API 2025-01 il campo `position` non è più presente in GraphQL.
+    Non ci serve per lo skip: usiamo solo altText.
     """
     query = """
     query($id: ID!) {
@@ -150,8 +153,7 @@ def list_existing_images(product_id: str) -> Dict[str, dict]:
             node {
               id
               altText
-              position
-              src
+              url
               width
               height
             }
@@ -169,6 +171,7 @@ def list_existing_images(product_id: str) -> Dict[str, dict]:
         if alt:
             images[alt] = node
     return images
+
 
 
 def create_product_image(product_id: str, attachment_b64: str, alt: str, position: Optional[int]=None, variant_id: Optional[str]=None) -> dict:
