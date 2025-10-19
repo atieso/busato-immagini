@@ -13,6 +13,11 @@ from typing import Dict, List, Tuple, Optional
 import requests
 
 # -----------------------
+# Versione script (per verifica nei log)
+# -----------------------
+SCRIPT_VERSION = "2025-10-19-mlsd-v2"
+
+# -----------------------
 # Config & logging
 # -----------------------
 logging.basicConfig(
@@ -253,7 +258,7 @@ def ftp_mlsd_safe(ftp: FTP, path: str):
     try:
         return list(ftp.mlsd(path, facts=["type", "size", "modify"]))
     except AttributeError:
-        # ftplib >= 3.8 ha mlsd; se siamo qui, il server non supporta MLSD
+        # ftplib ha mlsd; se siamo qui, il server può non supportare MLSD
         pass
     except EOFError:
         raise
@@ -343,7 +348,7 @@ def walk_ftp_files(ftp: FTP, base_dir: str) -> List[str]:
                 break
 
         if entries is None:
-            # Fallback: usa NLST per nomi, poi LIST per capire se dir/file
+            # Fallback: usa NLST per nomi, poi LIST per capire se dir/file (senza cwd)
             try:
                 names = ftp.nlst(current)
             except EOFError:
@@ -397,7 +402,7 @@ def walk_ftp_files(ftp: FTP, base_dir: str) -> List[str]:
             elif ftype == "file":
                 files.append(full_path)
             else:
-                # alcuni server usano valori non standard; trattiamo come file
+                # alcuni server usano valori non standard; trattiamo comunque come file
                 files.append(full_path)
 
     return files
@@ -496,7 +501,7 @@ def sync():
                     duplicated += 1
                     LOG.info("  - già presente (alt=%s), salto", alt)
                     position_counter += 1
-                    # Non spostiamo i duplicati per sicurezza: evita falsi positivi
+                    # Non spostiamo i duplicati per sicurezza
                     continue
 
                 try:
@@ -547,6 +552,7 @@ def sync():
 
 
 if __name__ == "__main__":
+    LOG.info("Script version: %s", SCRIPT_VERSION)
     LOG.info("Avvio sincronizzazione immagini FTP → Shopify (ordine _1, _2, ...)")
     LOG.info("DRY_RUN=%s | ALSO_ATTACH_TO_VARIANT=%s | MOVE_AFTER_UPLOAD=%s | PUBLISHED_DIR=%s",
              DRY_RUN, ALSO_ATTACH_TO_VARIANT, MOVE_AFTER_UPLOAD, PUBLISHED_ROOT)
