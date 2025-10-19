@@ -1,0 +1,28 @@
+services:
+  - type: cron
+    name: sync-ftp-to-shopify
+    runtime: python
+    region: frankfurt
+    plan: free
+    schedule: "0 3 * * *"  # esegue ogni notte alle 03:00
+    envVars:
+      - key: SHOPIFY_STORE
+        sync: false
+      - key: SHOPIFY_TOKEN
+        sync: false
+      - key: FTP_HOST
+        sync: false
+      - key: FTP_USER
+        sync: false
+      - key: FTP_PASSWORD
+        sync: false
+      - key: FTP_BASE_DIR
+        sync: false
+      - key: FTP_USE_TLS
+        sync: false
+      - key: ALSO_ATTACH_TO_VARIANT
+        sync: false
+      - key: DRY_RUN
+        sync: false
+    buildCommand: ""
+    startCommand: "python sync_ftp_images_to_shopify.py"
