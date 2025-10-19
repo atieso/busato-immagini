@@ -25,8 +25,14 @@ SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-01")
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASSWORD = os.getenv("FTP_PASSWORD")
-FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/")
+FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/").rstrip("/")
+
 FTP_USE_TLS = os.getenv("FTP_USE_TLS", "false").lower() == "true"
+
+# Soluzione 1: spostare i file pubblicati
+MOVE_AFTER_UPLOAD = os.getenv("MOVE_AFTER_UPLOAD", "false").lower() == "true"
+FTP_PUBLISHED_DIR = os.getenv("FTP_PUBLISHED_DIR", "/Pubblicate").strip("/")
+PUBLISHED_ROOT = (FTP_BASE_DIR + "/" + FTP_PUBLISHED_DIR).rstrip("/")
 
 # Opzioni
 ALSO_ATTACH_TO_VARIANT = os.getenv("ALSO_ATTACH_TO_VARIANT", "true").lower() == "true"
@@ -37,6 +43,27 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 # Regex filename: SKU_index (index numerico)
 FILENAME_RE = re.compile(r"^(?P<sku>.+?)_(?P<idx>\d+)$", re.IGNORECASE)
+
+
+# -----------------------
+# Util
+# -----------------------
+def to_numeric_id(gid: str) -> str:
+    return gid.rsplit("/", 1)[-1]
+
+def ftp_path_join(*parts: str) -> str:
+    clean = []
+    for p in parts:
+        if p is None:
+            continue
+        p = p.strip()
+        if not p:
+            continue
+        p = p.replace("\\", "/")
+        clean.append(p.strip("/"))
+    if not clean:
+        return "/"
+    return "/" + "/".join(clean)
 
 
 # -----------------------
@@ -61,7 +88,6 @@ def build_sku_index() -> Dict[str, Tuple[str, str]]:
     """
     Ritorna una mappa:
       sku -> (product_id, variant_id)
-    Gli ID sono in formato GraphQL (gid://shopify/Product/..., gid://shopify/ProductVariant/...)
     """
     LOG.info("Costruisco indice SKU da Shopify (productVariants)...")
     query = """
@@ -108,7 +134,6 @@ def list_existing_images(product_id: str) -> Dict[str, dict]:
     Restituisce dict alt_text -> image_dict per un prodotto,
     così evitiamo duplicati basati su alt (es. SKU_1, SKU_2, ...).
     """
-    # GraphQL per immagini prodotto
     query = """
     query($id: ID!) {
       product(id: $id) {
@@ -141,7 +166,6 @@ def list_existing_images(product_id: str) -> Dict[str, dict]:
 def create_product_image(product_id: str, attachment_b64: str, alt: str, position: Optional[int]=None, variant_id: Optional[str]=None) -> dict:
     """
     Crea un'immagine su un prodotto via REST, con 'attachment' base64.
-    Opzionalmente setta alt, position, e associa variant_id.
     """
     url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/products/{to_numeric_id(product_id)}/images.json"
     headers = {
@@ -157,7 +181,6 @@ def create_product_image(product_id: str, attachment_b64: str, alt: str, positio
     if position is not None:
         payload["image"]["position"] = position
     if ALSO_ATTACH_TO_VARIANT and variant_id:
-        # per associare l'immagine alla variant corretta
         payload["image"]["variant_ids"] = [to_numeric_id(variant_id)]
     if DRY_RUN:
         LOG.info("[DRY RUN] Creerei image %s (position=%s, variant=%s)", alt, position, variant_id)
@@ -166,13 +189,6 @@ def create_product_image(product_id: str, attachment_b64: str, alt: str, positio
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Create image HTTP {resp.status_code}: {resp.text}")
     return resp.json()
-
-
-def to_numeric_id(gid: str) -> str:
-    """
-    Converte un gid://shopify/Resource/1234567890 in "1234567890"
-    """
-    return gid.rsplit("/", 1)[-1]
 
 
 # -----------------------
@@ -189,54 +205,94 @@ def connect_ftp() -> FTP:
     return ftp
 
 
+def ftp_ensure_dir(ftp: FTP, path: str):
+    """
+    Crea ricorsivamente una directory (se non esiste).
+    """
+    if not path or path == "/":
+        return
+    parts = [p for p in path.split("/") if p]
+    cur = ""
+    for p in parts:
+        cur = ftp_path_join(cur, p)
+        try:
+            ftp.mkd(cur)
+        except Exception:
+            # esiste già
+            pass
+
+
+def ftp_move(ftp: FTP, src: str, dst: str):
+    """
+    Sposta (rename) un file, creando le cartelle di destinazione.
+    """
+    dst_dir = os.path.dirname(dst)
+    ftp_ensure_dir(ftp, dst_dir)
+    ftp.rename(src, dst)
+
+
 def walk_ftp_files(ftp: FTP, base_dir: str) -> List[str]:
     """
-    Ritorna la lista dei path dei file (relativi) sotto base_dir.
+    Ritorna la lista dei file (path assoluti) sotto base_dir,
+    escludendo la cartella Pubblicate (se abilitata).
     """
     files = []
+    exclude_prefix = PUBLISHED_ROOT + "/" if MOVE_AFTER_UPLOAD else None
+
+    def _is_excluded(path: str) -> bool:
+        if not exclude_prefix:
+            return False
+        # escludi "/base/Published" e tutto ciò che ci sta sotto
+        return path == PUBLISHED_ROOT or path.startswith(exclude_prefix)
 
     def _walk(cwd: str):
+        if _is_excluded(cwd):
+            return
         try:
             entries = []
             ftp.retrlines(f"MLSD {cwd}", entries.append)
-            # MLSD fornisce tipo; se non supportato, fallback LIST
+            # MLSD
+            names = []
             for line in entries:
-                # Esempio MLSD: "type=file;size=123;modify=20250101...; unique=...; filename"
-                parts, name = line.split(";", 1)[-1].strip().split(None, 1) if ";" in line else ("", line.strip())
-                # Purtroppo parsing MLSD varia; usiamo un fallback semplice:
-                name = name.strip()
+                # Dopo i facts tipo "type=file;size=...; modify=...; filename"
+                if ";" in line:
+                    name = line.split(";")[-1].strip()
+                else:
+                    name = line.strip()
                 if name in (".", ".."):
                     continue
-                full_path = f"{cwd.rstrip('/')}/{name}"
-                # Determinare se file o dir: tentiamo CWD
+                names.append(name)
+            for name in names:
+                full_path = ftp_path_join(cwd, name)
+                if _is_excluded(full_path):
+                    continue
+                # prova a fare CWD per capire se è dir
                 try:
                     cwd_before = ftp.pwd()
                     ftp.cwd(full_path)
                     ftp.cwd(cwd_before)
-                    # è directory
-                    _walk(full_path)
+                    _walk(full_path)  # directory
                 except error_perm:
-                    # è file
-                    files.append(full_path)
+                    files.append(full_path)  # file
         except error_perm:
-            # MLSD non supportato, usiamo LIST
+            # Fallback LIST
             listing = []
             ftp.retrlines(f"LIST {cwd}", listing.append)
             for line in listing:
-                # formato: drwxr-xr-x 1 user group size date name
                 parts = line.split()
                 if len(parts) < 9:
                     continue
                 name = " ".join(parts[8:])
                 if name in (".", ".."):
                     continue
-                full_path = f"{cwd.rstrip('/')}/{name}"
+                full_path = ftp_path_join(cwd, name)
                 if line.lower().startswith("d"):
                     _walk(full_path)
                 else:
-                    files.append(full_path)
+                    if not _is_excluded(full_path):
+                        files.append(full_path)
 
-    _walk(base_dir)
+    _walk(base_dir if base_dir else "/")
     return files
 
 
@@ -253,8 +309,8 @@ def parse_filename(fname: str) -> Optional[Tuple[str, int]]:
     """
     Ritorna (sku, idx) se il filename (senza estensione) è nel formato SKU_idx
     """
-    name, ext = os.path.splitext(os.path.basename(fname))
-    ext = ext.lower()
+    name = os.path.splitext(os.path.basename(fname))[0]
+    ext = os.path.splitext(os.path.basename(fname))[1].lower()
     if ext not in IMAGE_EXTS:
         return None
     m = FILENAME_RE.match(name)
@@ -273,7 +329,6 @@ def group_images_by_sku(file_paths: List[str]) -> Dict[str, List[Tuple[int, str]
             continue
         sku, idx = parsed
         groups.setdefault(sku, []).append((idx, path))
-    # ordina ciascun gruppo per idx
     for sku in groups:
         groups[sku].sort(key=lambda x: x[0])
     return groups
@@ -290,9 +345,10 @@ def sync():
         raise SystemExit("Config mancante: FTP_HOST / FTP_USER / FTP_PASSWORD")
     ftp = connect_ftp()
     try:
-        LOG.info("Scansione FTP da %s ...", FTP_BASE_DIR)
-        files = walk_ftp_files(ftp, FTP_BASE_DIR)
-        LOG.info("Trovati %d file totali su FTP", len(files))
+        LOG.info("Scansione FTP da %s ...", FTP_BASE_DIR or "/")
+        files = walk_ftp_files(ftp, FTP_BASE_DIR or "/")
+        LOG.info("Trovati %d file totali su FTP (escludendo '%s')",
+                 len(files), PUBLISHED_ROOT if MOVE_AFTER_UPLOAD else "N/A")
         groups = group_images_by_sku(files)
         LOG.info("Trovati %d SKU con immagini nel formato atteso", len(groups))
     finally:
@@ -301,13 +357,13 @@ def sync():
         except Exception:
             pass
 
-    # 3) Per ogni SKU presente sia su FTP che su Shopify, carica in ordine
+    # 3) Upload ordinato + spostamento
     uploaded_count = 0
     skipped_unknown_sku = 0
     duplicated = 0
     errors = 0
 
-    # Ri-connetti FTP per download (alcuni server chiudono dopo LIST lunghe)
+    # ri-connetti per sicurezza
     ftp = connect_ftp()
 
     try:
@@ -318,10 +374,10 @@ def sync():
                 continue
 
             product_id, variant_id = sku_map[sku]
-            existing_by_alt = {}
             try:
                 existing_by_alt = list_existing_images(product_id)
             except Exception as e:
+                existing_by_alt = {}
                 LOG.error("Errore nel recupero immagini esistenti per %s: %s", sku, e)
 
             LOG.info("==> SKU %s | %d immagini da sincronizzare", sku, len(items))
@@ -333,12 +389,13 @@ def sync():
                     duplicated += 1
                     LOG.info("  - già presente (alt=%s), salto", alt)
                     position_counter += 1
+                    # opzionalmente potresti spostare comunque il file, ma è più sicuro non farlo
                     continue
 
                 try:
                     content = ftp_read_file(ftp, path)
                     attachment_b64 = base64.b64encode(content).decode("ascii")
-                    resp = create_product_image(
+                    create_product_image(
                         product_id=product_id,
                         attachment_b64=attachment_b64,
                         alt=alt,
@@ -347,16 +404,23 @@ def sync():
                     )
                     uploaded_count += 1
                     LOG.info("  + caricato %s (pos=%d)%s",
-                             alt,
-                             position_counter,
-                             " [DRY RUN]" if DRY_RUN else "")
-                    # rispetto limiti API
-                    time.sleep(0.4)  # ~2.5 rps
+                             alt, position_counter, " [DRY RUN]" if DRY_RUN else "")
+                    time.sleep(0.4)  # rate limit safety
+                    # Move after successful upload (if enabled & not dry run)
+                    if MOVE_AFTER_UPLOAD and not DRY_RUN:
+                        # calcola path relativo a FTP_BASE_DIR per mantenere la struttura
+                        rel = path[len(FTP_BASE_DIR):] if path.startswith(FTP_BASE_DIR) else path
+                        rel = rel.lstrip("/")
+                        dst = ftp_path_join(FTP_BASE_DIR, FTP_PUBLISHED_DIR, rel)
+                        try:
+                            ftp_move(ftp, path, dst)
+                            LOG.info("    ↪ spostato su %s", dst)
+                        except Exception as me:
+                            LOG.warning("    ⚠ impossibile spostare %s → %s: %s", path, dst, me)
                     position_counter += 1
                 except Exception as e:
                     errors += 1
                     LOG.error("  ! errore su %s: %s", path, e)
-                    # backoff leggero
                     time.sleep(1.0)
 
     finally:
@@ -374,5 +438,6 @@ def sync():
 
 if __name__ == "__main__":
     LOG.info("Avvio sincronizzazione immagini FTP → Shopify (ordine _1, _2, ...)")
-    LOG.info("DRY_RUN=%s | ALSO_ATTACH_TO_VARIANT=%s", DRY_RUN, ALSO_ATTACH_TO_VARIANT)
+    LOG.info("DRY_RUN=%s | ALSO_ATTACH_TO_VARIANT=%s | MOVE_AFTER_UPLOAD=%s | PUBLISHED_DIR=%s",
+             DRY_RUN, ALSO_ATTACH_TO_VARIANT, MOVE_AFTER_UPLOAD, PUBLISHED_ROOT)
     sync()
