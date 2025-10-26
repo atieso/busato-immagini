@@ -1,10 +1,12 @@
 services:
   - type: cron
-    name: sync-ftp-to-shopify
-    runtime: python
-    region: frankfurt
+    name: sync-ftp-images
+    env: python
     plan: starter
+    runtime: python
     schedule: "0 3 * * *"  # ogni giorno alle 03:00
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python sync_ftp_images_to_shopify.py"
     envVars:
       - key: SHOPIFY_STORE
         sync: false
@@ -24,5 +26,3 @@ services:
         sync: false
       - key: DRY_RUN
         sync: false
-    buildCommand: ""
-    startCommand: "python sync_ftp_images_to_shopify.py"
