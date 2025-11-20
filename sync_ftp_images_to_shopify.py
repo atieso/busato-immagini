@@ -397,9 +397,29 @@ def walk_ftp_files(ftp: FTP, base_dir: str) -> List[str]:
 
 
 def ftp_read_file(ftp: FTP, path: str) -> bytes:
-    bio = io.BytesIO()
-    ftp.retrbinary(f"RETR %s" % path, bio.write)
-    return bio.getvalue()
+    """
+    Scarica un file via FTP con fino a 3 tentativi automatici
+    in caso di disconnessione (Broken pipe, EOF, ecc.)
+    """
+    attempts = 0
+    while attempts < 3:
+        bio = io.BytesIO()
+        try:
+            ftp.retrbinary(f"RETR {path}", bio.write)
+            return bio.getvalue()
+        except (EOFError, OSError, ConnectionResetError, BrokenPipeError) as e:
+            attempts += 1
+            LOG.warning("Connessione interrotta durante RETR %s (tentativo %d/3): %s",
+                        path, attempts, e)
+            try:
+                ftp = ftp_reconnect()
+            except Exception as re:
+                LOG.warning("Errore nella riconnessione FTP: %s", re)
+            time.sleep(2)
+
+    # dopo 3 tentativi falliti, lo segnaliamo come errore "definitivo"
+    raise RuntimeError(f"Impossibile leggere {path} dopo 3 tentativi (Broken pipe)")
+
 
 
 # -----------------------
