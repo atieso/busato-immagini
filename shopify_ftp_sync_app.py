@@ -150,10 +150,7 @@ def ftp_connect() -> ftplib.FTP:
 
 
 def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
-    """
-    Ritorna lista di tuple: (directory, filename, size)
-    Supporta sia una cartella unica sia split dirs come /0 /1 /2 ...
-    """
+    log.info("Avvio scansione FTP...")
     results: List[Tuple[str, str, int]] = []
     ftp = ftp_connect()
     try:
@@ -164,11 +161,16 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
         else:
             candidate_dirs.append(FTP_BASE_DIR)
 
+        log.info("Directory da scansionare: %s", candidate_dirs)
+
         for directory in candidate_dirs:
+            log.info("Entro in %s", directory)
             try:
                 ftp.cwd(directory)
                 names = ftp.nlst()
-            except Exception:
+                log.info("Trovati %s file in %s", len(names), directory)
+            except Exception as e:
+                log.exception("Errore su directory %s: %s", directory, e)
                 continue
 
             for name in names:
@@ -187,6 +189,7 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
         except Exception:
             pass
 
+    log.info("Scansione FTP completata. File immagine trovati: %s", len(results))
     return results
 
 
@@ -516,6 +519,15 @@ def reorder_product_media(product_id: str, ordered_media_ids: List[str]) -> None
 # Core sync
 # =========================
 def sync_images() -> SyncResponse:
+    log.info("Inizio sync_images()")
+    state = load_state()
+    scanned = matched = uploaded = skipped = 0
+    errors: List[str] = []
+
+    ftp_files = ftp_walk_image_files()
+    scanned = len(ftp_files)
+    log.info("File FTP letti: %s", scanned)
+
     state = load_state()
     scanned = matched = uploaded = skipped = 0
     errors: List[str] = []
