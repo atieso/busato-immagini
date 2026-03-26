@@ -138,10 +138,13 @@ def shopify_graphql(query: str, variables: Optional[Dict] = None) -> Dict:
 # FTP
 # =========================
 def ftp_connect() -> ftplib.FTP:
+    log.info("Connessione FTP a %s...", FTP_HOST)
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, 21, timeout=FTP_TIMEOUT)
+    log.info("FTP connesso, login...")
     ftp.login(FTP_USER, FTP_PASS)
     ftp.set_pasv(FTP_PASSIVE)
+    log.info("FTP login OK")
     return ftp
 
 
