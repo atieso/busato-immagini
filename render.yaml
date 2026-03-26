@@ -1,28 +1,39 @@
 services:
   - type: cron
-    name: sync-ftp-images
-    env: python
-    plan: starter
+    name: shopify-ftp-sync-cron
     runtime: python
-    schedule: "0 3 * * *"  # ogni giorno alle 03:00
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python sync_ftp_images_to_shopify.py"
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -c "from shopify_ftp_sync_app import sync_images; print(sync_images().model_dump_json(indent=2))"
+    schedule: "0 3 * * *"
+
     envVars:
-      - key: SHOPIFY_STORE
+      - key: PYTHON_VERSION
+        value: 3.11.11
+
+      - key: SHOPIFY_SHOP
         sync: false
-      - key: SHOPIFY_TOKEN
+      - key: SHOPIFY_CLIENT_ID
         sync: false
+      - key: SHOPIFY_CLIENT_SECRET
+        sync: false
+
+      - key: SHOPIFY_API_VERSION
+        value: 2026-01
+
       - key: FTP_HOST
         sync: false
       - key: FTP_USER
         sync: false
-      - key: FTP_PASSWORD
+      - key: FTP_PASS
         sync: false
       - key: FTP_BASE_DIR
-        sync: false
-      - key: FTP_USE_TLS
-        sync: false
-      - key: ALSO_ATTACH_TO_VARIANT
-        sync: false
-      - key: DRY_RUN
-        sync: false
+        value: /public_html/IMG
+      - key: FTP_SPLIT_DIRS
+        value: 0,1,2,3,4,5,6,7,8,9
+      - key: FTP_PASSIVE
+        value: "true"
+      - key: FTP_TIMEOUT
+        value: "30"
+      - key: STATE_FILE
+        value: sync_state.json
