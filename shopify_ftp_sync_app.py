@@ -4,25 +4,45 @@ import time
 import json
 import ftplib
 import hashlib
+import logging
 import mimetypes
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s", force=True)
-log = logging.getLogger("sync")
+try:
+    from fastapi import FastAPI, HTTPException
+except Exception:
+    FastAPI = None
+
+    class HTTPException(Exception):
+        def __init__(self, status_code: int = 500, detail=None):
+            self.status_code = status_code
+            self.detail = detail
+            super().__init__(str(detail))
+
+
+# =========================
+# Logging
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s | %(message)s",
+    force=True,
+)
+log = logging.getLogger("shopify_ftp_sync")
+
 
 # =========================
 # Config
 # =========================
-SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "")  # es: tuo-store.myshopify.com oppure solo handle
+SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "")
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-01")
+SHOPIFY_FILE_READY_TIMEOUT = int(os.getenv("SHOPIFY_FILE_READY_TIMEOUT", "120"))
 
 FTP_HOST = os.getenv("FTP_HOST", "")
 FTP_USER = os.getenv("FTP_USER", "")
@@ -30,21 +50,17 @@ FTP_PASS = os.getenv("FTP_PASS", "")
 FTP_BASE_DIR = os.getenv("FTP_BASE_DIR", "/")
 FTP_PASSIVE = os.getenv("FTP_PASSIVE", "true").lower() == "true"
 FTP_TIMEOUT = int(os.getenv("FTP_TIMEOUT", "30"))
-
-# Cartella/i FTP opzionali, es: 0,1,2,3,4,5,6,7,8,9
 FTP_SPLIT_DIRS = [x.strip() for x in os.getenv("FTP_SPLIT_DIRS", "").split(",") if x.strip()]
 
-# Stato locale (per produzione meglio Postgres/Redis)
 STATE_FILE = os.getenv("STATE_FILE", "sync_state.json")
-
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 FILENAME_RE = re.compile(r"^(?P<sku>.+?)(?:_(?P<index>\d+))?$", re.IGNORECASE)
 
 
 # =========================
-# FastAPI
+# FastAPI app (opzionale)
 # =========================
-app = FastAPI(title="Shopify FTP Image Sync")
+app = FastAPI(title="Shopify FTP Image Sync") if FastAPI else None
 
 
 class SyncResponse(BaseModel):
@@ -56,13 +72,17 @@ class SyncResponse(BaseModel):
 
 
 # =========================
-# Utility stato locale
+# Stato locale
 # =========================
 def load_state() -> Dict:
     if not os.path.exists(STATE_FILE):
         return {"files": {}}
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        log.warning("Impossibile leggere %s, riparto con stato vuoto", STATE_FILE)
+        return {"files": {}}
 
 
 
@@ -72,15 +92,17 @@ def save_state(state: Dict) -> None:
 
 
 # =========================
-# Shopify auth (Dev Dashboard)
+# Shopify auth
 # =========================
-_token_cache = {"value": None, "expires_at": 0}
+_token_cache = {"value": None, "expires_at": 0.0}
 
 
 def normalize_shop(shop: str) -> str:
     shop = shop.strip()
     if shop.startswith("https://"):
         shop = shop.replace("https://", "")
+    if shop.endswith("/"):
+        shop = shop[:-1]
     if not shop.endswith(".myshopify.com"):
         shop = f"{shop}.myshopify.com"
     return shop
@@ -93,7 +115,11 @@ def get_admin_access_token() -> str:
         return _token_cache["value"]
 
     shop = normalize_shop(SHOPIFY_SHOP)
+    if not shop or not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+        raise RuntimeError("Credenziali Shopify mancanti")
+
     url = f"https://{shop}/admin/oauth/access_token"
+    log.info("Richiedo access token Shopify per %s", shop)
     resp = requests.post(
         url,
         json={
@@ -105,11 +131,11 @@ def get_admin_access_token() -> str:
     )
     resp.raise_for_status()
     data = resp.json()
-
     token = data["access_token"]
     expires_in = data.get("expires_in", 86399)
     _token_cache["value"] = token
     _token_cache["expires_at"] = now + expires_in
+    log.info("Access token ottenuto")
     return token
 
 
@@ -125,7 +151,7 @@ def shopify_graphql(query: str, variables: Optional[Dict] = None) -> Dict:
             "X-Shopify-Access-Token": token,
         },
         json={"query": query, "variables": variables or {}},
-        timeout=60,
+        timeout=120,
     )
     resp.raise_for_status()
     payload = resp.json()
@@ -138,6 +164,9 @@ def shopify_graphql(query: str, variables: Optional[Dict] = None) -> Dict:
 # FTP
 # =========================
 def ftp_connect() -> ftplib.FTP:
+    if not FTP_HOST or not FTP_USER or not FTP_PASS:
+        raise RuntimeError("Credenziali FTP mancanti")
+
     log.info("Connessione FTP a %s...", FTP_HOST)
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, 21, timeout=FTP_TIMEOUT)
@@ -168,7 +197,7 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
             try:
                 ftp.cwd(directory)
                 names = ftp.nlst()
-                log.info("Trovati %s file in %s", len(names), directory)
+                log.info("Trovati %s elementi in %s", len(names), directory)
             except Exception as e:
                 log.exception("Errore su directory %s: %s", directory, e)
                 continue
@@ -195,12 +224,15 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
 
 
 def ftp_read_file(directory: str, filename: str) -> bytes:
+    log.info("Leggo file FTP %s/%s", directory, filename)
     ftp = ftp_connect()
     bio = BytesIO()
     try:
         ftp.cwd(directory)
         ftp.retrbinary(f"RETR {filename}", bio.write)
-        return bio.getvalue()
+        data = bio.getvalue()
+        log.info("File letto: %s (%s bytes)", filename, len(data))
+        return data
     finally:
         try:
             ftp.quit()
@@ -209,7 +241,7 @@ def ftp_read_file(directory: str, filename: str) -> bytes:
 
 
 # =========================
-# Naming e matching
+# Naming e fingerprint
 # =========================
 def parse_filename(filename: str) -> Optional[Dict]:
     base, ext = os.path.splitext(filename)
@@ -239,9 +271,10 @@ def file_fingerprint(content: bytes) -> str:
 
 
 # =========================
-# Shopify queries
+# Shopify queries/mutations
 # =========================
 def get_variant_by_sku(sku: str) -> Optional[Dict]:
+    log.info("Cerco SKU su Shopify: %s", sku)
     query = """
     query GetVariantBySku($query: String!) {
       productVariants(first: 5, query: $query) {
@@ -271,18 +304,17 @@ def get_variant_by_sku(sku: str) -> Optional[Dict]:
     """
     data = shopify_graphql(query, {"query": f"sku:{sku}"})
     nodes = data["productVariants"]["nodes"]
-
-    # match esatto, case-insensitive
     for node in nodes:
         if (node.get("sku") or "").strip().lower() == sku.lower():
+            log.info("SKU trovato: %s", sku)
             return node
+    log.warning("SKU non trovato: %s", sku)
     return None
 
 
-# =========================
-# Shopify upload media
-# =========================
+
 def staged_upload_create(filename: str, mime_type: str, file_size: int) -> Dict:
+    log.info("Creo staged upload per %s", filename)
     mutation = """
     mutation StagedUploadsCreate($input: [StagedUploadInput!]!) {
       stagedUploadsCreate(input: $input) {
@@ -321,16 +353,19 @@ def staged_upload_create(filename: str, mime_type: str, file_size: int) -> Dict:
 
 
 def upload_to_staged_target(staged_target: Dict, content: bytes, filename: str, mime_type: str) -> str:
+    log.info("Carico file su staged target: %s", filename)
     url = staged_target["url"]
     fields = {p["name"]: p["value"] for p in staged_target["parameters"]}
     files = {"file": (filename, content, mime_type)}
-    resp = requests.post(url, data=fields, files=files, timeout=120)
+    resp = requests.post(url, data=fields, files=files, timeout=180)
     resp.raise_for_status()
+    log.info("Upload completato: %s", filename)
     return staged_target["resourceUrl"]
 
 
 
 def file_create_from_resource(resource_url: str, alt: str) -> str:
+    log.info("Creo file Shopify da resource URL")
     mutation = """
     mutation FileCreate($files: [FileCreateInput!]!) {
       fileCreate(files: $files) {
@@ -364,11 +399,14 @@ def file_create_from_resource(resource_url: str, alt: str) -> str:
     payload = data["fileCreate"]
     if payload["userErrors"]:
         raise RuntimeError(payload["userErrors"])
-    return payload["files"][0]["id"]
+    file_id = payload["files"][0]["id"]
+    log.info("File Shopify creato: %s", file_id)
+    return file_id
 
 
 
-def wait_file_ready(file_id: str, timeout_seconds: int = 120) -> None:
+def wait_file_ready(file_id: str, timeout_seconds: int = SHOPIFY_FILE_READY_TIMEOUT) -> None:
+    log.info("Attendo READY per file %s", file_id)
     query = """
     query WaitFile($id: ID!) {
       node(id: $id) {
@@ -400,6 +438,7 @@ def wait_file_ready(file_id: str, timeout_seconds: int = 120) -> None:
         if not node:
             raise RuntimeError(f"File non trovato: {file_id}")
         status = node.get("fileStatus")
+        log.info("file %s status=%s", file_id, status)
         if status == "READY":
             return
         if status == "FAILED":
@@ -410,6 +449,7 @@ def wait_file_ready(file_id: str, timeout_seconds: int = 120) -> None:
 
 
 def attach_file_to_product(product_id: str, file_id: str, alt: str) -> None:
+    log.info("Associo file %s al prodotto %s", file_id, product_id)
     mutation = """
     mutation AttachFileToProduct($input: ProductSetInput!) {
       productSet(input: $input) {
@@ -443,6 +483,9 @@ def attach_file_to_product(product_id: str, file_id: str, alt: str) -> None:
 
 
 def append_media_to_variant(product_id: str, variant_id: str, media_ids: List[str]) -> None:
+    if not media_ids:
+        return
+    log.info("Associo %s media alla variante %s", len(media_ids), variant_id)
     mutation = """
     mutation AppendMediaToVariant($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
       productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
@@ -475,26 +518,10 @@ def append_media_to_variant(product_id: str, variant_id: str, media_ids: List[st
 
 
 
-def get_product_media_ids(product_id: str) -> List[str]:
-    query = """
-    query GetProductMedia($id: ID!) {
-      product(id: $id) {
-        id
-        media(first: 100) {
-          nodes {
-            id
-            alt
-          }
-        }
-      }
-    }
-    """
-    data = shopify_graphql(query, {"id": product_id})
-    return [node["id"] for node in data["product"]["media"]["nodes"]]
-
-
-
 def reorder_product_media(product_id: str, ordered_media_ids: List[str]) -> None:
+    if not ordered_media_ids:
+        return
+    log.info("Riordino media del prodotto %s", product_id)
     moves = [{"id": media_id, "newPosition": pos} for pos, media_id in enumerate(ordered_media_ids)]
     mutation = """
     mutation ReorderMedia($id: ID!, $moves: [MoveInput!]!) {
@@ -528,15 +555,7 @@ def sync_images() -> SyncResponse:
     scanned = len(ftp_files)
     log.info("File FTP letti: %s", scanned)
 
-    state = load_state()
-    scanned = matched = uploaded = skipped = 0
-    errors: List[str] = []
-
-    ftp_files = ftp_walk_image_files()
-    scanned = len(ftp_files)
-
     grouped: Dict[str, List[Dict]] = {}
-
     for directory, filename, size in ftp_files:
         parsed = parse_filename(filename)
         if not parsed:
@@ -550,7 +569,10 @@ def sync_images() -> SyncResponse:
         }
         grouped.setdefault(parsed["sku"], []).append(item)
 
+    log.info("SKU raggruppati: %s", len(grouped))
+
     for sku, items in grouped.items():
+        log.info("Elaboro SKU: %s | immagini: %s", sku, len(items))
         try:
             variant = get_variant_by_sku(sku)
             if not variant:
@@ -560,10 +582,9 @@ def sync_images() -> SyncResponse:
             matched += 1
             product_id = variant["product"]["id"]
             variant_id = variant["id"]
+            log.info("SKU %s trovato. Product=%s Variant=%s", sku, product_id, variant_id)
 
-            # Ordine: base (0), poi _1, _2...
             items.sort(key=lambda x: (x["position"], x["filename"]))
-
             newly_added_media_ids: List[str] = []
 
             for item in items:
@@ -573,6 +594,7 @@ def sync_images() -> SyncResponse:
 
                 prev = state["files"].get(path_key)
                 if prev and prev.get("fingerprint") == fingerprint:
+                    log.info("File già sincronizzato, salto: %s", path_key)
                     skipped += 1
                     if prev.get("media_id"):
                         newly_added_media_ids.append(prev["media_id"])
@@ -585,7 +607,6 @@ def sync_images() -> SyncResponse:
                 resource_url = upload_to_staged_target(staged, raw, item["filename"], mime_type)
                 file_id = file_create_from_resource(resource_url, alt)
                 wait_file_ready(file_id)
-
                 attach_file_to_product(product_id, file_id, alt)
                 newly_added_media_ids.append(file_id)
                 uploaded += 1
@@ -598,37 +619,59 @@ def sync_images() -> SyncResponse:
                 }
                 save_state(state)
 
-            # Associa tutte le nuove immagini alla variante SKU corrispondente
             if newly_added_media_ids:
                 append_media_to_variant(product_id, variant_id, newly_added_media_ids)
-
-                # Riordino semplice: le media nuove nello stesso ordine filename
-                # Nota: in produzione conviene leggere tutte le media del prodotto e comporre l'ordine finale.
-                reorder_product_media(product_id, newly_added_media_ids)
+                try:
+                    reorder_product_media(product_id, newly_added_media_ids)
+                except Exception as e:
+                    log.warning("Riordino media fallito per SKU %s: %s", sku, e)
 
         except Exception as exc:
+            log.exception("Errore SKU %s: %s", sku, exc)
             errors.append(f"Errore SKU {sku}: {exc}")
 
     save_state(state)
-    return SyncResponse(
+    result = SyncResponse(
         scanned=scanned,
         matched=matched,
         uploaded=uploaded,
         skipped=skipped,
         errors=errors,
     )
+    log.info("Sync completata: %s", result.model_dump())
+    return result
 
 
 # =========================
-# API endpoints
+# FastAPI routes (solo se FastAPI disponibile)
 # =========================
-@app.get("/health")
-def health():
-    return {"ok": True}
+if app is not None:
+
+    @app.get("/health")
+    def health():
+        return {"ok": True}
 
 
-@app.post("/sync", response_model=SyncResponse)
-def run_sync():
+    @app.post("/sync", response_model=SyncResponse)
+    def run_sync():
+        required = {
+            "SHOPIFY_SHOP": SHOPIFY_SHOP,
+            "SHOPIFY_CLIENT_ID": SHOPIFY_CLIENT_ID,
+            "SHOPIFY_CLIENT_SECRET": SHOPIFY_CLIENT_SECRET,
+            "FTP_HOST": FTP_HOST,
+            "FTP_USER": FTP_USER,
+            "FTP_PASS": FTP_PASS,
+        }
+        missing = [k for k, v in required.items() if not v]
+        if missing:
+            raise HTTPException(status_code=500, detail={"missing_env": missing})
+        return sync_images()
+
+
+# =========================
+# CLI entrypoint per Render Cron Job
+# =========================
+def main() -> None:
     required = {
         "SHOPIFY_SHOP": SHOPIFY_SHOP,
         "SHOPIFY_CLIENT_ID": SHOPIFY_CLIENT_ID,
@@ -639,9 +682,11 @@ def run_sync():
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        raise HTTPException(status_code=500, detail={"missing_env": missing})
-    return sync_images()
+        raise RuntimeError(f"Variabili ambiente mancanti: {missing}")
+
+    result = sync_images()
+    print(result.model_dump_json(indent=2), flush=True)
 
 
-# Avvio locale:
-# uvicorn shopify_ftp_sync_app:app --reload --port 8000
+if __name__ == "__main__":
+    main()
