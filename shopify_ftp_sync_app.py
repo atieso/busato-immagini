@@ -12,6 +12,9 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s", force=True)
+log = logging.getLogger("sync")
 
 # =========================
 # Config
