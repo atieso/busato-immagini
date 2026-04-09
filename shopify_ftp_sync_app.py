@@ -22,7 +22,7 @@ except Exception:
             self.status_code = status_code
             self.detail = detail
             super().__init__(str(detail))
- 
+
 
 # =========================
 # Logging
@@ -57,6 +57,9 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 FILENAME_RE = re.compile(r"^(?P<sku>.+?)(?:_(?P<index>\d+))?$", re.IGNORECASE)
 TEST_MAX_FILES = int(os.getenv("TEST_MAX_FILES", "0"))
 
+media_hash_cache: Dict[str, str] = {}
+product_media_cache: Dict[str, List[Dict]] = {}
+
 
 # =========================
 # FastAPI app (opzionale)
@@ -70,7 +73,7 @@ class SyncResponse(BaseModel):
     uploaded: int
     skipped: int
     errors: List[str]
- 
+
 
 # =========================
 # Stato locale
@@ -282,6 +285,16 @@ def file_fingerprint(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def download_bytes(url: str) -> bytes:
+    resp = requests.get(url, timeout=120)
+    resp.raise_for_status()
+    return resp.content
+
+
 # =========================
 # Shopify queries/mutations
 # =========================
@@ -323,6 +336,121 @@ def get_variant_by_sku(sku: str) -> Optional[Dict]:
     log.warning("SKU non trovato: %s", sku)
     return None
 
+
+
+def get_product_media_images(product_id: str) -> List[Dict]:
+    """
+    Restituisce tutte le immagini media del prodotto.
+    """
+    if product_id in product_media_cache:
+        return product_media_cache[product_id]
+
+    query = """
+    query GetProductMediaImages($id: ID!) {
+      product(id: $id) {
+        id
+        media(first: 250) {
+          nodes {
+            id
+            alt
+            mediaContentType
+            ... on MediaImage {
+              image {
+                url
+              }
+              originalSource {
+                url
+                fileSize
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = shopify_graphql(query, {"id": product_id})
+    nodes = data["product"]["media"]["nodes"]
+    images = [node for node in nodes if node.get("mediaContentType") == "IMAGE"]
+    product_media_cache[product_id] = images
+    return images
+
+
+def get_media_hash(media_node: Dict) -> Optional[str]:
+    media_id = media_node["id"]
+    if media_id in media_hash_cache:
+        return media_hash_cache[media_id]
+
+    original_url = ((media_node.get("originalSource") or {}).get("url"))
+    fallback_url = ((media_node.get("image") or {}).get("url"))
+    source_url = original_url or fallback_url
+    if not source_url:
+        return None
+
+    try:
+        data = download_bytes(source_url)
+        h = sha256_bytes(data)
+        media_hash_cache[media_id] = h
+        return h
+    except Exception as exc:
+        log.warning("Impossibile calcolare hash media %s: %s", media_id, exc)
+        return None
+
+
+def invalidate_product_media_cache(product_id: str, media_ids: Optional[List[str]] = None) -> None:
+    product_media_cache.pop(product_id, None)
+    if media_ids:
+        for media_id in media_ids:
+            media_hash_cache.pop(media_id, None)
+
+
+def find_existing_media_and_duplicates(product_id: str, ftp_bytes: bytes, expected_alt: str) -> Tuple[Optional[str], List[str]]:
+    """
+    Cerca nel prodotto un'immagine identica a quella FTP.
+    Restituisce:
+      - media_id da tenere/riutilizzare
+      - lista media_id duplicati da eliminare
+    """
+    target_hash = sha256_bytes(ftp_bytes)
+    matches: List[Dict] = []
+
+    for media_node in get_product_media_images(product_id):
+        media_hash = get_media_hash(media_node)
+        if media_hash and media_hash == target_hash:
+            matches.append(media_node)
+
+    if not matches:
+        return None, []
+
+    # Preferisci, se esiste, il media con alt coerente col file
+    keep_node = next((m for m in matches if (m.get("alt") or "").strip() == expected_alt.strip()), matches[0])
+    duplicate_ids = [m["id"] for m in matches if m["id"] != keep_node["id"]]
+    return keep_node["id"], duplicate_ids
+
+
+def delete_duplicate_product_media(product_id: str, media_ids: List[str]) -> None:
+    if not media_ids:
+        return
+
+    unique_ids = list(dict.fromkeys(media_ids))
+    log.info("Elimino media duplicati dal prodotto %s: %s", product_id, unique_ids)
+
+    mutation = """
+    mutation DeleteDuplicateMedia($productId: ID!, $mediaIds: [ID!]!) {
+      productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
+        deletedMediaIds
+        mediaUserErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    data = shopify_graphql(mutation, {"productId": product_id, "mediaIds": unique_ids})
+    errors = data["productDeleteMedia"]["mediaUserErrors"]
+    if errors:
+        raise RuntimeError(errors)
+
+    invalidate_product_media_cache(product_id, unique_ids)
 
 
 def staged_upload_create(filename: str, mime_type: str, file_size: int) -> Dict:
@@ -608,13 +736,10 @@ def attach_media_to_variant(product_id: str, variant_id: str, media_id: str) -> 
 
 
 def reorder_product_media(product_id: str, ordered_media_ids: List[str]) -> None:
+    if not ordered_media_ids:
+        return
     log.info("Riordino media del prodotto %s", product_id)
-
-    moves = [
-        {"id": media_id, "newPosition": str(pos)}
-        for pos, media_id in enumerate(ordered_media_ids)
-    ]
-
+    moves = [{"id": media_id, "newPosition": str(pos)} for pos, media_id in enumerate(ordered_media_ids)]
     mutation = """
     mutation ReorderMedia($id: ID!, $moves: [MoveInput!]!) {
       productReorderMedia(id: $id, moves: $moves) {
@@ -683,17 +808,33 @@ def sync_images() -> SyncResponse:
                 path_key = item["path_key"]
                 raw = ftp_read_file(item["directory"], item["filename"])
                 fingerprint = file_fingerprint(raw)
+                mime_type = mimetypes.guess_type(item["filename"])[0] or "image/jpeg"
+                alt = f"{sku} - {item['filename']}"
+
+                existing_media_id, duplicate_media_ids = find_existing_media_and_duplicates(product_id, raw, alt)
+                if existing_media_id:
+                    log.info("Immagine già presente sul prodotto. Riuso media %s", existing_media_id)
+                    newly_added_media_ids.append(existing_media_id)
+                    attach_media_to_variant(product_id, variant_id, existing_media_id)
+
+                    if duplicate_media_ids:
+                        log.info("Trovati duplicati da eliminare: %s", duplicate_media_ids)
+                        delete_duplicate_product_media(product_id, duplicate_media_ids)
+
+                    state["files"][path_key] = {
+                        "sku": sku,
+                        "fingerprint": fingerprint,
+                        "file_id": None,
+                        "media_id": existing_media_id,
+                        "uploaded_at": int(time.time()),
+                    }
+                    save_state(state)
+                    skipped += 1
+                    continue
 
                 prev = state["files"].get(path_key)
                 if prev and prev.get("fingerprint") == fingerprint:
-                    log.info("File già sincronizzato, salto: %s", path_key)
-                    skipped += 1
-                    if prev.get("media_id"):
-                        newly_added_media_ids.append(prev["media_id"])
-                    continue
-
-                mime_type = mimetypes.guess_type(item["filename"])[0] or "image/jpeg"
-                alt = f"{sku} - {item['filename']}"
+                    log.info("File già sincronizzato in stato locale ma non trovato sul prodotto, ricarico: %s", path_key)
 
                 staged = staged_upload_create(item["filename"], mime_type, len(raw))
                 resource_url = upload_to_staged_target(staged, raw, item["filename"], mime_type)
@@ -704,25 +845,37 @@ def sync_images() -> SyncResponse:
                 log.info("CDN URL file READY: %s", cdn_url)
 
                 product_media_id = attach_media_to_product(product_id, cdn_url, alt)
-                newly_added_media_ids.append(product_media_id)
+                invalidate_product_media_cache(product_id)
+
+                # Pulizia duplicati eventuali dopo il nuovo upload
+                keep_media_id, duplicate_media_ids = find_existing_media_and_duplicates(product_id, raw, alt)
+                final_media_id = keep_media_id or product_media_id
+                if duplicate_media_ids:
+                    duplicate_media_ids = [m for m in duplicate_media_ids if m != final_media_id]
+                    if duplicate_media_ids:
+                        delete_duplicate_product_media(product_id, duplicate_media_ids)
+
+                newly_added_media_ids.append(final_media_id)
                 uploaded += 1
 
                 state["files"][path_key] = {
                     "sku": sku,
                     "fingerprint": fingerprint,
                     "file_id": file_id,
-                    "media_id": product_media_id,
+                    "media_id": final_media_id,
                     "uploaded_at": int(time.time()),
                 }
                 save_state(state)
 
             if newly_added_media_ids:
-                for media_id in newly_added_media_ids:
+                ordered_unique_media_ids = list(dict.fromkeys(newly_added_media_ids))
+                for media_id in ordered_unique_media_ids:
                     attach_media_to_variant(product_id, variant_id, media_id)
-                try:
-                    reorder_product_media(product_id, newly_added_media_ids)
-                except Exception as e:
-                    log.warning("Riordino media fallito per SKU %s: %s", sku, e)
+                if len(ordered_unique_media_ids) > 1:
+                    try:
+                        reorder_product_media(product_id, ordered_unique_media_ids)
+                    except Exception as e:
+                        log.warning("Riordino media fallito per SKU %s: %s", sku, e)
 
         except Exception as exc:
             log.exception("Errore SKU %s: %s", sku, exc)
