@@ -608,10 +608,13 @@ def attach_media_to_variant(product_id: str, variant_id: str, media_id: str) -> 
 
 
 def reorder_product_media(product_id: str, ordered_media_ids: List[str]) -> None:
-    if not ordered_media_ids:
-        return
     log.info("Riordino media del prodotto %s", product_id)
-    moves = [{"id": media_id, "newPosition": pos} for pos, media_id in enumerate(ordered_media_ids)]
+
+    moves = [
+        {"id": media_id, "newPosition": str(pos)}
+        for pos, media_id in enumerate(ordered_media_ids)
+    ]
+
     mutation = """
     mutation ReorderMedia($id: ID!, $moves: [MoveInput!]!) {
       productReorderMedia(id: $id, moves: $moves) {
