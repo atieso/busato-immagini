@@ -55,6 +55,7 @@ FTP_SPLIT_DIRS = [x.strip() for x in os.getenv("FTP_SPLIT_DIRS", "").split(",") 
 STATE_FILE = os.getenv("STATE_FILE", "sync_state.json")
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 FILENAME_RE = re.compile(r"^(?P<sku>.+?)(?:_(?P<index>\d+))?$", re.IGNORECASE)
+TEST_MAX_FILES = int(os.getenv("TEST_MAX_FILES", "0"))
 
 
 # =========================
@@ -179,6 +180,11 @@ def ftp_connect() -> ftplib.FTP:
 
 
 def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
+    """
+    Ritorna lista di tuple: (directory, filename, size)
+    Versione veloce: non usa ftp.size() per ogni file.
+    Se TEST_MAX_FILES > 0, interrompe la scansione ai primi N file immagine validi.
+    """
     log.info("Avvio scansione FTP...")
     results: List[Tuple[str, str, int]] = []
     ftp = ftp_connect()
@@ -191,6 +197,8 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
             candidate_dirs.append(FTP_BASE_DIR)
 
         log.info("Directory da scansionare: %s", candidate_dirs)
+        if TEST_MAX_FILES > 0:
+            log.info("TEST_MAX_FILES attivo: %s", TEST_MAX_FILES)
 
         for directory in candidate_dirs:
             log.info("Entro in %s", directory)
@@ -202,16 +210,22 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
                 log.exception("Errore su directory %s: %s", directory, e)
                 continue
 
+            added = 0
             for name in names:
                 ext = os.path.splitext(name)[1].lower()
                 if ext not in ALLOWED_EXTENSIONS:
                     continue
-                size = 0
-                try:
-                    size = ftp.size(name) or 0
-                except Exception:
-                    pass
-                results.append((directory, name, size))
+
+                # Non interrogo ftp.size(name): su molti server FTP rallenta drasticamente.
+                results.append((directory, name, 0))
+                added += 1
+
+                if TEST_MAX_FILES > 0 and len(results) >= TEST_MAX_FILES:
+                    log.info("Raggiunto TEST_MAX_FILES=%s", TEST_MAX_FILES)
+                    log.info("File immagine validi in %s: %s", directory, added)
+                    return results
+
+            log.info("File immagine validi in %s: %s", directory, added)
     finally:
         try:
             ftp.quit()
@@ -220,8 +234,6 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
 
     log.info("Scansione FTP completata. File immagine trovati: %s", len(results))
     return results
-
-
 
 def ftp_read_file(directory: str, filename: str) -> bytes:
     log.info("Leggo file FTP %s/%s", directory, filename)
