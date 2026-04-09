@@ -70,7 +70,7 @@ class SyncResponse(BaseModel):
     uploaded: int
     skipped: int
     errors: List[str]
-
+ 
 
 # =========================
 # Stato locale
