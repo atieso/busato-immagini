@@ -23,7 +23,7 @@ except Exception:
             self.detail = detail
             super().__init__(str(detail))
 
-
+ 
 # =========================
 # Logging
 # =========================
