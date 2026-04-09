@@ -405,25 +405,51 @@ def invalidate_product_media_cache(product_id: str, media_ids: Optional[List[str
 
 def find_existing_media_and_duplicates(product_id: str, ftp_bytes: bytes, expected_alt: str) -> Tuple[Optional[str], List[str]]:
     """
-    Cerca nel prodotto un'immagine identica a quella FTP.
-    Restituisce:
-      - media_id da tenere/riutilizzare
-      - lista media_id duplicati da eliminare
+    Cerca nel prodotto un'immagine già presente.
+    Priorità:
+    1) stesso ALT (più affidabile per immagini caricate da questa app)
+    2) stesso hash bytes come fallback
     """
-    target_hash = sha256_bytes(ftp_bytes)
-    matches: List[Dict] = []
+    images = get_product_media_images(product_id)
 
-    for media_node in get_product_media_images(product_id):
+    # 1) Match per ALT
+    alt_matches = [
+        m for m in images
+        if (m.get("alt") or "").strip() == expected_alt.strip()
+    ]
+
+    if alt_matches:
+        keep_node = alt_matches[0]
+        duplicate_ids = [m["id"] for m in alt_matches[1:]]
+        log.info(
+            "Match per ALT trovato per %s: keep=%s duplicati=%s",
+            expected_alt,
+            keep_node["id"],
+            duplicate_ids,
+        )
+        return keep_node["id"], duplicate_ids
+
+    # 2) Fallback per hash
+    target_hash = sha256_bytes(ftp_bytes)
+    hash_matches: List[Dict] = []
+
+    for media_node in images:
         media_hash = get_media_hash(media_node)
         if media_hash and media_hash == target_hash:
-            matches.append(media_node)
+            hash_matches.append(media_node)
 
-    if not matches:
+    if not hash_matches:
+        log.info("Nessun match esistente trovato per %s", expected_alt)
         return None, []
 
-    # Preferisci, se esiste, il media con alt coerente col file
-    keep_node = next((m for m in matches if (m.get("alt") or "").strip() == expected_alt.strip()), matches[0])
-    duplicate_ids = [m["id"] for m in matches if m["id"] != keep_node["id"]]
+    keep_node = hash_matches[0]
+    duplicate_ids = [m["id"] for m in hash_matches[1:] if m["id"] != keep_node["id"]]
+    log.info(
+        "Match per HASH trovato per %s: keep=%s duplicati=%s",
+        expected_alt,
+        keep_node["id"],
+        duplicate_ids,
+    )
     return keep_node["id"], duplicate_ids
 
 
@@ -446,10 +472,12 @@ def delete_duplicate_product_media(product_id: str, media_ids: List[str]) -> Non
     }
     """
     data = shopify_graphql(mutation, {"productId": product_id, "mediaIds": unique_ids})
-    errors = data["productDeleteMedia"]["mediaUserErrors"]
+    payload = data["productDeleteMedia"]
+    errors = payload["mediaUserErrors"]
     if errors:
         raise RuntimeError(errors)
 
+    log.info("Media eliminati davvero dal prodotto: %s", payload.get("deletedMediaIds", []))
     invalidate_product_media_cache(product_id, unique_ids)
 
 
