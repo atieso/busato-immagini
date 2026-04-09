@@ -460,13 +460,75 @@ def wait_file_ready(file_id: str, timeout_seconds: int = SHOPIFY_FILE_READY_TIME
 
 
 
-def attach_file_to_product(product_id: str, file_id: str, alt: str) -> None:
-    log.info("Associo file %s al prodotto %s", file_id, product_id)
+def get_file_cdn_url(file_id: str) -> str:
+    log.info("Recupero CDN URL per file %s", file_id)
+    query = """
+    query GetFileCdnUrl($id: ID!) {
+      node(id: $id) {
+        ... on MediaImage {
+          id
+          fileStatus
+          image {
+            url
+          }
+          preview {
+            image {
+              url
+            }
+          }
+        }
+        ... on GenericFile {
+          id
+          fileStatus
+          preview {
+            image {
+              url
+            }
+          }
+        }
+      }
+    }
+    """
+    data = shopify_graphql(query, {"id": file_id})
+    node = data.get("node")
+    if not node:
+        raise RuntimeError(f"File non trovato: {file_id}")
+
+    cdn_url = (
+        ((node.get("image") or {}).get("url"))
+        or (((node.get("preview") or {}).get("image") or {}).get("url"))
+    )
+
+    if not cdn_url:
+        raise RuntimeError(f"CDN URL non trovata per file {file_id}")
+
+    log.info("CDN URL recuperata per %s", file_id)
+    return cdn_url
+
+
+
+def attach_media_to_product(product_id: str, source_url: str, alt: str) -> str:
+    log.info("Associo media al prodotto %s tramite URL CDN", product_id)
     mutation = """
-    mutation AttachFileToProduct($input: ProductSetInput!) {
-      productSet(input: $input) {
+    mutation UpdateProductWithMedia($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
+      productUpdate(product: $product, media: $media) {
         product {
           id
+          media(first: 20) {
+            nodes {
+              id
+              alt
+              mediaContentType
+              ... on MediaImage {
+                image {
+                  url
+                }
+                preview {
+                  status
+                }
+              }
+            }
+          }
         }
         userErrors {
           field
@@ -476,36 +538,51 @@ def attach_file_to_product(product_id: str, file_id: str, alt: str) -> None:
     }
     """
     variables = {
-        "input": {
-            "id": product_id,
-            "files": [
-                {
-                    "originalSource": file_id,
-                    "alt": alt,
-                    "contentType": "IMAGE",
-                }
-            ],
-        }
+        "product": {"id": product_id},
+        "media": [
+            {
+                "originalSource": source_url,
+                "alt": alt,
+                "mediaContentType": "IMAGE",
+            }
+        ],
     }
     data = shopify_graphql(mutation, variables)
-    errors = data["productSet"]["userErrors"]
-    if errors:
-        raise RuntimeError(errors)
+    payload = data["productUpdate"]
+    if payload["userErrors"]:
+        raise RuntimeError(payload["userErrors"])
+
+    nodes = payload["product"]["media"]["nodes"]
+    for node in reversed(nodes):
+        if node.get("alt") == alt:
+            media_id = node["id"]
+            log.info("Media associato al prodotto: %s", media_id)
+            return media_id
+        image_url = ((node.get("image") or {}).get("url"))
+        if image_url == source_url:
+            media_id = node["id"]
+            log.info("Media associato al prodotto: %s", media_id)
+            return media_id
+
+    raise RuntimeError("Media associato al prodotto ma ID non trovato nel payload")
 
 
 
-def append_media_to_variant(product_id: str, variant_id: str, media_ids: List[str]) -> None:
-    if not media_ids:
-        return
-    log.info("Associo %s media alla variante %s", len(media_ids), variant_id)
+def attach_media_to_variant(product_id: str, variant_id: str, media_id: str) -> None:
+    log.info("Associo media %s alla variante %s", media_id, variant_id)
     mutation = """
-    mutation AppendMediaToVariant($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
-      productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+    mutation UpdateVariantMedia($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
         product {
           id
         }
         productVariants {
           id
+          media(first: 10) {
+            nodes {
+              id
+            }
+          }
         }
         userErrors {
           field
@@ -516,15 +593,15 @@ def append_media_to_variant(product_id: str, variant_id: str, media_ids: List[st
     """
     variables = {
         "productId": product_id,
-        "variantMedia": [
+        "variants": [
             {
-                "variantId": variant_id,
-                "mediaIds": media_ids,
+                "id": variant_id,
+                "mediaId": media_id,
             }
         ],
     }
     data = shopify_graphql(mutation, variables)
-    errors = data["productVariantAppendMedia"]["userErrors"]
+    errors = data["productVariantsBulkUpdate"]["userErrors"]
     if errors:
         raise RuntimeError(errors)
 
@@ -619,20 +696,26 @@ def sync_images() -> SyncResponse:
                 resource_url = upload_to_staged_target(staged, raw, item["filename"], mime_type)
                 file_id = file_create_from_resource(resource_url, alt)
                 wait_file_ready(file_id)
-                attach_file_to_product(product_id, file_id, alt)
-                newly_added_media_ids.append(file_id)
+
+                cdn_url = get_file_cdn_url(file_id)
+                log.info("CDN URL file READY: %s", cdn_url)
+
+                product_media_id = attach_media_to_product(product_id, cdn_url, alt)
+                newly_added_media_ids.append(product_media_id)
                 uploaded += 1
 
                 state["files"][path_key] = {
                     "sku": sku,
                     "fingerprint": fingerprint,
-                    "media_id": file_id,
+                    "file_id": file_id,
+                    "media_id": product_media_id,
                     "uploaded_at": int(time.time()),
                 }
                 save_state(state)
 
             if newly_added_media_ids:
-                append_media_to_variant(product_id, variant_id, newly_added_media_ids)
+                for media_id in newly_added_media_ids:
+                    attach_media_to_variant(product_id, variant_id, media_id)
                 try:
                     reorder_product_media(product_id, newly_added_media_ids)
                 except Exception as e:
