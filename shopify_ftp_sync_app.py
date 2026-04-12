@@ -22,8 +22,8 @@ except Exception:
             self.status_code = status_code
             self.detail = detail
             super().__init__(str(detail))
- 
- 
+
+
 # =========================
 # Logging
 # =========================
@@ -56,6 +56,11 @@ STATE_FILE = os.getenv("STATE_FILE", "sync_state.json")
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 FILENAME_RE = re.compile(r"^(?P<sku>.+?)(?:_(?P<index>\d+))?$", re.IGNORECASE)
 TEST_MAX_FILES = int(os.getenv("TEST_MAX_FILES", "0"))
+
+FTP_AFTER_SYNC_ACTION = os.getenv("FTP_AFTER_SYNC_ACTION", "move").strip().lower()
+FTP_PUBLISHED_DIR = os.getenv("FTP_PUBLISHED_DIR", "").strip()
+FTP_RENAMED_PREFIX = os.getenv("FTP_RENAMED_PREFIX", "_SYNCED_").strip() or "_SYNCED_"
+FTP_RENAMED_SUFFIX = os.getenv("FTP_RENAMED_SUFFIX", "").strip()
 
 media_hash_cache: Dict[str, str] = {}
 product_media_cache: Dict[str, List[Dict]] = {}
@@ -255,6 +260,108 @@ def ftp_read_file(directory: str, filename: str) -> bytes:
             pass
 
 
+def ftp_path_join(*parts: str) -> str:
+    cleaned = [p.strip("/") for p in parts if p not in (None, "")]
+    if not cleaned:
+        return "/"
+    return "/" + "/".join(cleaned)
+
+
+def ftp_ensure_dir(ftp: ftplib.FTP, path: str) -> None:
+    path = path.strip()
+    if not path or path == "/":
+        return
+
+    current = ""
+    for part in [p for p in path.strip("/").split("/") if p]:
+        current = f"{current}/{part}" if current else f"/{part}"
+        try:
+            ftp.cwd(current)
+        except Exception:
+            try:
+                ftp.mkd(current)
+            except Exception:
+                # Se la directory esiste già o il server risponde in modo non standard, riprova a entrarci
+                pass
+            ftp.cwd(current)
+
+
+def ftp_archive_file(directory: str, filename: str) -> Dict[str, str]:
+    """
+    Dopo una sync riuscita:
+    - move  -> sposta il file in FTP_PUBLISHED_DIR[/subdir]
+    - rename -> rinomina il file nella stessa directory
+    - none -> non fa nulla
+    """
+    action = FTP_AFTER_SYNC_ACTION
+    if action in ("", "none", "off", "false", "0"):
+        return {"action": "none", "path": f"{directory}/{filename}"}
+
+    ftp = ftp_connect()
+    try:
+        ftp.cwd(directory)
+
+        if action == "move":
+            if not FTP_PUBLISHED_DIR:
+                raise RuntimeError("FTP_PUBLISHED_DIR mancante per FTP_AFTER_SYNC_ACTION=move")
+
+            subdir = directory.rstrip("/").split("/")[-1]
+            target_dir = ftp_path_join(FTP_PUBLISHED_DIR, subdir) if subdir.isdigit() else FTP_PUBLISHED_DIR
+            ftp_ensure_dir(ftp, target_dir)
+
+            target_name = filename
+            target_path = ftp_path_join(target_dir, target_name)
+
+            if _ftp_file_exists(ftp, target_path):
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                base, ext = os.path.splitext(filename)
+                target_name = f"{base}__{stamp}{ext}"
+                target_path = ftp_path_join(target_dir, target_name)
+
+            source_path = ftp_path_join(directory, filename)
+            ftp.rename(source_path, target_path)
+            log.info("File FTP spostato: %s -> %s", source_path, target_path)
+            return {"action": "move", "path": target_path}
+
+        if action == "rename":
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            base, ext = os.path.splitext(filename)
+            new_name = f"{FTP_RENAMED_PREFIX}{base}{FTP_RENAMED_SUFFIX}"
+            if not FTP_RENAMED_SUFFIX:
+                new_name = f"{new_name}__{stamp}"
+            new_name = f"{new_name}{ext}"
+
+            source_path = ftp_path_join(directory, filename)
+            target_path = ftp_path_join(directory, new_name)
+            ftp.rename(source_path, target_path)
+            log.info("File FTP rinominato: %s -> %s", source_path, target_path)
+            return {"action": "rename", "path": target_path}
+
+        raise RuntimeError(f"FTP_AFTER_SYNC_ACTION non supportata: {action}")
+
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+
+def _ftp_file_exists(ftp: ftplib.FTP, absolute_path: str) -> bool:
+    parent = "/" + "/".join([p for p in absolute_path.strip("/").split("/")[:-1]])
+    name = absolute_path.strip("/").split("/")[-1]
+    original_pwd = ftp.pwd()
+    try:
+        ftp.cwd(parent or "/")
+        return name in ftp.nlst()
+    except Exception:
+        return False
+    finally:
+        try:
+            ftp.cwd(original_pwd)
+        except Exception:
+            pass
+
+
 # =========================
 # Naming e fingerprint
 # =========================
@@ -371,6 +478,7 @@ def get_product_media_images(product_id: str) -> List[Dict]:
     data = shopify_graphql(query, {"id": product_id})
     nodes = data["product"]["media"]["nodes"]
     images = [node for node in nodes if node.get("mediaContentType") == "IMAGE"]
+    log.info("Media immagine attuali sul prodotto %s: %s", product_id, len(images))
     product_media_cache[product_id] = images
     return images
 
@@ -412,12 +520,10 @@ def find_existing_media_and_duplicates(product_id: str, ftp_bytes: bytes, expect
     """
     images = get_product_media_images(product_id)
 
-    # 1) Match per ALT
     alt_matches = [
         m for m in images
         if (m.get("alt") or "").strip() == expected_alt.strip()
     ]
-
     if alt_matches:
         keep_node = alt_matches[0]
         duplicate_ids = [m["id"] for m in alt_matches[1:]]
@@ -429,10 +535,8 @@ def find_existing_media_and_duplicates(product_id: str, ftp_bytes: bytes, expect
         )
         return keep_node["id"], duplicate_ids
 
-    # 2) Fallback per hash
     target_hash = sha256_bytes(ftp_bytes)
     hash_matches: List[Dict] = []
-
     for media_node in images:
         media_hash = get_media_hash(media_node)
         if media_hash and media_hash == target_hash:
@@ -849,12 +953,16 @@ def sync_images() -> SyncResponse:
                         log.info("Trovati duplicati da eliminare: %s", duplicate_media_ids)
                         delete_duplicate_product_media(product_id, duplicate_media_ids)
 
+                    archive_info = ftp_archive_file(item["directory"], item["filename"])
+
                     state["files"][path_key] = {
                         "sku": sku,
                         "fingerprint": fingerprint,
                         "file_id": None,
                         "media_id": existing_media_id,
                         "uploaded_at": int(time.time()),
+                        "ftp_after_sync_action": archive_info["action"],
+                        "ftp_after_sync_path": archive_info["path"],
                     }
                     save_state(state)
                     skipped += 1
@@ -884,6 +992,7 @@ def sync_images() -> SyncResponse:
                         delete_duplicate_product_media(product_id, duplicate_media_ids)
 
                 newly_added_media_ids.append(final_media_id)
+                archive_info = ftp_archive_file(item["directory"], item["filename"])
                 uploaded += 1
 
                 state["files"][path_key] = {
@@ -892,6 +1001,8 @@ def sync_images() -> SyncResponse:
                     "file_id": file_id,
                     "media_id": final_media_id,
                     "uploaded_at": int(time.time()),
+                    "ftp_after_sync_action": archive_info["action"],
+                    "ftp_after_sync_path": archive_info["path"],
                 }
                 save_state(state)
 
