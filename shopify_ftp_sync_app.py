@@ -62,6 +62,8 @@ FTP_PUBLISHED_DIR = os.getenv("FTP_PUBLISHED_DIR", "").strip()
 FTP_RENAMED_PREFIX = os.getenv("FTP_RENAMED_PREFIX", "_SYNCED_").strip() or "_SYNCED_"
 FTP_RENAMED_SUFFIX = os.getenv("FTP_RENAMED_SUFFIX", "").strip()
 
+PRODUCT_MEDIA_PAGE_SIZE = 250
+
 media_hash_cache: Dict[str, str] = {}
 product_media_cache: Dict[str, List[Dict]] = {}
 
@@ -94,7 +96,6 @@ def load_state() -> Dict:
         return {"files": {}}
 
 
-
 def save_state(state: Dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -115,7 +116,6 @@ def normalize_shop(shop: str) -> str:
     if not shop.endswith(".myshopify.com"):
         shop = f"{shop}.myshopify.com"
     return shop
-
 
 
 def get_admin_access_token() -> str:
@@ -146,7 +146,6 @@ def get_admin_access_token() -> str:
     _token_cache["expires_at"] = now + expires_in
     log.info("Access token ottenuto")
     return token
-
 
 
 def shopify_graphql(query: str, variables: Optional[Dict] = None) -> Dict:
@@ -186,7 +185,6 @@ def ftp_connect() -> ftplib.FTP:
     return ftp
 
 
-
 def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
     """
     Ritorna lista di tuple: (directory, filename, size)
@@ -224,7 +222,6 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
                 if ext not in ALLOWED_EXTENSIONS:
                     continue
 
-                # Non interrogo ftp.size(name): su molti server FTP rallenta drasticamente.
                 results.append((directory, name, 0))
                 added += 1
 
@@ -242,6 +239,7 @@ def ftp_walk_image_files() -> List[Tuple[str, str, int]]:
 
     log.info("Scansione FTP completata. File immagine trovati: %s", len(results))
     return results
+
 
 def ftp_read_file(directory: str, filename: str) -> bytes:
     log.info("Leggo file FTP %s/%s", directory, filename)
@@ -281,9 +279,24 @@ def ftp_ensure_dir(ftp: ftplib.FTP, path: str) -> None:
             try:
                 ftp.mkd(current)
             except Exception:
-                # Se la directory esiste già o il server risponde in modo non standard, riprova a entrarci
                 pass
             ftp.cwd(current)
+
+
+def _ftp_file_exists(ftp: ftplib.FTP, absolute_path: str) -> bool:
+    parent = "/" + "/".join([p for p in absolute_path.strip("/").split("/")[:-1]])
+    name = absolute_path.strip("/").split("/")[-1]
+    original_pwd = ftp.pwd()
+    try:
+        ftp.cwd(parent or "/")
+        return name in ftp.nlst()
+    except Exception:
+        return False
+    finally:
+        try:
+            ftp.cwd(original_pwd)
+        except Exception:
+            pass
 
 
 def ftp_archive_file(directory: str, filename: str) -> Dict[str, str]:
@@ -311,7 +324,6 @@ def ftp_archive_file(directory: str, filename: str) -> Dict[str, str]:
 
             target_name = filename
             target_path = ftp_path_join(target_dir, target_name)
-
             if _ftp_file_exists(ftp, target_path):
                 stamp = time.strftime("%Y%m%d-%H%M%S")
                 base, ext = os.path.splitext(filename)
@@ -330,7 +342,6 @@ def ftp_archive_file(directory: str, filename: str) -> Dict[str, str]:
             if not FTP_RENAMED_SUFFIX:
                 new_name = f"{new_name}__{stamp}"
             new_name = f"{new_name}{ext}"
-
             source_path = ftp_path_join(directory, filename)
             target_path = ftp_path_join(directory, new_name)
             ftp.rename(source_path, target_path)
@@ -338,26 +349,9 @@ def ftp_archive_file(directory: str, filename: str) -> Dict[str, str]:
             return {"action": "rename", "path": target_path}
 
         raise RuntimeError(f"FTP_AFTER_SYNC_ACTION non supportata: {action}")
-
     finally:
         try:
             ftp.quit()
-        except Exception:
-            pass
-
-
-def _ftp_file_exists(ftp: ftplib.FTP, absolute_path: str) -> bool:
-    parent = "/" + "/".join([p for p in absolute_path.strip("/").split("/")[:-1]])
-    name = absolute_path.strip("/").split("/")[-1]
-    original_pwd = ftp.pwd()
-    try:
-        ftp.cwd(parent or "/")
-        return name in ftp.nlst()
-    except Exception:
-        return False
-    finally:
-        try:
-            ftp.cwd(original_pwd)
         except Exception:
             pass
 
@@ -387,7 +381,6 @@ def parse_filename(filename: str) -> Optional[Dict]:
     }
 
 
-
 def file_fingerprint(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -400,6 +393,22 @@ def download_bytes(url: str) -> bytes:
     resp = requests.get(url, timeout=120)
     resp.raise_for_status()
     return resp.content
+
+
+def build_expected_alt(sku: str, filename: str) -> str:
+    return f"{sku} - {filename}"
+
+
+def extract_filename_from_alt_for_sku(alt: str, sku: str) -> Optional[str]:
+    prefix = f"{sku} - "
+    alt = (alt or "").strip()
+    if not alt.startswith(prefix):
+        return None
+    filename = alt[len(prefix):].strip()
+    parsed = parse_filename(filename)
+    if not parsed or parsed["sku"].lower() != sku.lower():
+        return None
+    return filename
 
 
 # =========================
@@ -417,18 +426,6 @@ def get_variant_by_sku(sku: str) -> Optional[Dict]:
           product {
             id
             title
-            media(first: 100) {
-              nodes {
-                id
-                alt
-                mediaContentType
-                ... on MediaImage {
-                  image {
-                    url
-                  }
-                }
-              }
-            }
           }
         }
       }
@@ -444,11 +441,7 @@ def get_variant_by_sku(sku: str) -> Optional[Dict]:
     return None
 
 
-
 def get_product_media_images(product_id: str) -> List[Dict]:
-    """
-    Restituisce tutte le immagini media del prodotto.
-    """
     if product_id in product_media_cache:
         return product_media_cache[product_id]
 
@@ -513,48 +506,49 @@ def invalidate_product_media_cache(product_id: str, media_ids: Optional[List[str
 
 def find_existing_media_and_duplicates(product_id: str, ftp_bytes: bytes, expected_alt: str) -> Tuple[Optional[str], List[str]]:
     """
-    Cerca nel prodotto un'immagine già presente.
-    Priorità:
-    1) stesso ALT (più affidabile per immagini caricate da questa app)
-    2) stesso hash bytes come fallback
+    Trova sul prodotto un'immagine che corrisponde al file FTP.
+    Riconosce come match:
+    - stesso ALT
+    - stesso hash contenuto
+
+    Restituisce:
+    - media_id da tenere/riusare
+    - eventuali media_id duplicati da rimuovere
     """
     images = get_product_media_images(product_id)
-
-    alt_matches = [
-        m for m in images
-        if (m.get("alt") or "").strip() == expected_alt.strip()
-    ]
-    if alt_matches:
-        keep_node = alt_matches[0]
-        duplicate_ids = [m["id"] for m in alt_matches[1:]]
-        log.info(
-            "Match per ALT trovato per %s: keep=%s duplicati=%s",
-            expected_alt,
-            keep_node["id"],
-            duplicate_ids,
-        )
-        return keep_node["id"], duplicate_ids
-
     target_hash = sha256_bytes(ftp_bytes)
-    hash_matches: List[Dict] = []
-    for media_node in images:
-        media_hash = get_media_hash(media_node)
-        if media_hash and media_hash == target_hash:
-            hash_matches.append(media_node)
 
-    if not hash_matches:
+    matched_nodes: List[Dict] = []
+    seen_ids = set()
+
+    for media_node in images:
+        media_id = media_node["id"]
+        same_alt = (media_node.get("alt") or "").strip() == expected_alt.strip()
+        same_hash = False
+        if not same_alt:
+            media_hash = get_media_hash(media_node)
+            same_hash = bool(media_hash and media_hash == target_hash)
+        if same_alt or same_hash:
+            if media_id not in seen_ids:
+                matched_nodes.append(media_node)
+                seen_ids.add(media_id)
+
+    if not matched_nodes:
         log.info("Nessun match esistente trovato per %s", expected_alt)
         return None, []
 
-    keep_node = hash_matches[0]
-    duplicate_ids = [m["id"] for m in hash_matches[1:] if m["id"] != keep_node["id"]]
+    # Preferenza: 1) alt esatto 2) primo match per hash
+    matched_nodes.sort(key=lambda n: (0 if (n.get("alt") or "").strip() == expected_alt.strip() else 1, n["id"]))
+    keep_id = matched_nodes[0]["id"]
+    duplicate_ids = [node["id"] for node in matched_nodes[1:] if node["id"] != keep_id]
+
     log.info(
-        "Match per HASH trovato per %s: keep=%s duplicati=%s",
+        "Match trovato per %s: keep=%s duplicati=%s",
         expected_alt,
-        keep_node["id"],
+        keep_id,
         duplicate_ids,
     )
-    return keep_node["id"], duplicate_ids
+    return keep_id, duplicate_ids
 
 
 def delete_duplicate_product_media(product_id: str, media_ids: List[str]) -> None:
@@ -581,8 +575,9 @@ def delete_duplicate_product_media(product_id: str, media_ids: List[str]) -> Non
     if errors:
         raise RuntimeError(errors)
 
-    log.info("Media eliminati davvero dal prodotto: %s", payload.get("deletedMediaIds", []))
-    invalidate_product_media_cache(product_id, unique_ids)
+    deleted_ids = payload.get("deletedMediaIds", [])
+    log.info("Media eliminati davvero dal prodotto: %s", deleted_ids)
+    invalidate_product_media_cache(product_id, deleted_ids or unique_ids)
 
 
 def staged_upload_create(filename: str, mime_type: str, file_size: int) -> Dict:
@@ -623,7 +618,6 @@ def staged_upload_create(filename: str, mime_type: str, file_size: int) -> Dict:
     return payload["stagedTargets"][0]
 
 
-
 def upload_to_staged_target(staged_target: Dict, content: bytes, filename: str, mime_type: str) -> str:
     log.info("Carico file su staged target: %s", filename)
     url = staged_target["url"]
@@ -633,7 +627,6 @@ def upload_to_staged_target(staged_target: Dict, content: bytes, filename: str, 
     resp.raise_for_status()
     log.info("Upload completato: %s", filename)
     return staged_target["resourceUrl"]
-
 
 
 def file_create_from_resource(resource_url: str, alt: str) -> str:
@@ -674,7 +667,6 @@ def file_create_from_resource(resource_url: str, alt: str) -> str:
     file_id = payload["files"][0]["id"]
     log.info("File Shopify creato: %s", file_id)
     return file_id
-
 
 
 def wait_file_ready(file_id: str, timeout_seconds: int = SHOPIFY_FILE_READY_TIMEOUT) -> None:
@@ -719,7 +711,6 @@ def wait_file_ready(file_id: str, timeout_seconds: int = SHOPIFY_FILE_READY_TIME
     raise TimeoutError(f"Timeout attesa READY per {file_id}")
 
 
-
 def get_file_cdn_url(file_id: str) -> str:
     log.info("Recupero CDN URL per file %s", file_id)
     query = """
@@ -754,17 +745,12 @@ def get_file_cdn_url(file_id: str) -> str:
     if not node:
         raise RuntimeError(f"File non trovato: {file_id}")
 
-    cdn_url = (
-        ((node.get("image") or {}).get("url"))
-        or (((node.get("preview") or {}).get("image") or {}).get("url"))
-    )
-
+    cdn_url = ((node.get("image") or {}).get("url")) or (((node.get("preview") or {}).get("image") or {}).get("url"))
     if not cdn_url:
         raise RuntimeError(f"CDN URL non trovata per file {file_id}")
 
     log.info("CDN URL recuperata per %s", file_id)
     return cdn_url
-
 
 
 def attach_media_to_product(product_id: str, source_url: str, alt: str) -> str:
@@ -827,7 +813,6 @@ def attach_media_to_product(product_id: str, source_url: str, alt: str) -> str:
     raise RuntimeError("Media associato al prodotto ma ID non trovato nel payload")
 
 
-
 def attach_media_to_variant(product_id: str, variant_id: str, media_id: str) -> None:
     log.info("Associo media %s alla variante %s", media_id, variant_id)
     mutation = """
@@ -866,7 +851,6 @@ def attach_media_to_variant(product_id: str, variant_id: str, media_id: str) -> 
         raise RuntimeError(errors)
 
 
-
 def reorder_product_media(product_id: str, ordered_media_ids: List[str]) -> None:
     if not ordered_media_ids:
         return
@@ -889,6 +873,100 @@ def reorder_product_media(product_id: str, ordered_media_ids: List[str]) -> None
     errors = data["productReorderMedia"]["mediaUserErrors"]
     if errors:
         raise RuntimeError(errors)
+
+
+# =========================
+# Deduplica + ordine finale
+# =========================
+def dedupe_product_media_for_sku(product_id: str, sku: str, preferred_media_by_filename: Optional[Dict[str, str]] = None) -> List[Dict]:
+    """
+    Deduplica tutte le immagini del prodotto appartenenti allo SKU.
+    Ritorna i media tenuti, ordinabili per filename/position.
+
+    Regola:
+    - considera solo i media con alt del formato "SKU - filename.ext"
+    - per ogni filename tiene un solo media
+    - preferisce l'ID passato in preferred_media_by_filename[filename]
+    """
+    preferred_media_by_filename = preferred_media_by_filename or {}
+    images = get_product_media_images(product_id)
+
+    groups: Dict[str, List[Dict]] = {}
+    for media_node in images:
+        filename = extract_filename_from_alt_for_sku(media_node.get("alt") or "", sku)
+        if not filename:
+            continue
+        groups.setdefault(filename, []).append(media_node)
+
+    keep_nodes: List[Dict] = []
+    duplicate_ids: List[str] = []
+
+    for filename, nodes in groups.items():
+        parsed = parse_filename(filename)
+        preferred_id = preferred_media_by_filename.get(filename)
+
+        keep_node = None
+        if preferred_id:
+            keep_node = next((n for n in nodes if n["id"] == preferred_id), None)
+        if keep_node is None:
+            exact_alt = build_expected_alt(sku, filename)
+            keep_node = next((n for n in nodes if (n.get("alt") or "").strip() == exact_alt), None)
+        if keep_node is None:
+            keep_node = nodes[0]
+
+        keep_nodes.append(
+            {
+                **keep_node,
+                "_sku_filename": filename,
+                "_sku_position": parsed["position"] if parsed else 999999,
+            }
+        )
+        duplicate_ids.extend([n["id"] for n in nodes if n["id"] != keep_node["id"]])
+
+    if duplicate_ids:
+        log.info("Deduplica SKU %s sul prodotto %s: duplicati=%s", sku, product_id, duplicate_ids)
+        delete_duplicate_product_media(product_id, duplicate_ids)
+        images = get_product_media_images(product_id)
+        refreshed_keep_nodes: List[Dict] = []
+        keep_ids = {node["id"] for node in keep_nodes}
+        for media_node in images:
+            if media_node["id"] not in keep_ids:
+                continue
+            filename = extract_filename_from_alt_for_sku(media_node.get("alt") or "", sku)
+            if not filename:
+                continue
+            parsed = parse_filename(filename)
+            refreshed_keep_nodes.append(
+                {
+                    **media_node,
+                    "_sku_filename": filename,
+                    "_sku_position": parsed["position"] if parsed else 999999,
+                }
+            )
+        keep_nodes = refreshed_keep_nodes
+
+    keep_nodes.sort(key=lambda n: (n.get("_sku_position", 999999), n.get("_sku_filename", ""), n["id"]))
+    return keep_nodes
+
+
+def reorder_full_product_gallery_for_sku(product_id: str, sku: str, preferred_media_by_filename: Optional[Dict[str, str]] = None) -> None:
+    """
+    Riordina l'intera gallery del prodotto mettendo prima tutte le immagini dello SKU,
+    nell'ordine SKU.jpg, SKU_1.jpg, SKU_2.jpg..., lasciando poi il resto della gallery
+    nell'ordine attuale.
+    """
+    sku_media_nodes = dedupe_product_media_for_sku(product_id, sku, preferred_media_by_filename)
+    sku_ids_sorted = [node["id"] for node in sku_media_nodes]
+    all_images = get_product_media_images(product_id)
+    current_ids = [node["id"] for node in all_images]
+    tail_ids = [media_id for media_id in current_ids if media_id not in sku_ids_sorted]
+    final_order = sku_ids_sorted + tail_ids
+
+    if not final_order:
+        return
+
+    log.info("Ordine finale media per SKU %s sul prodotto %s: %s", sku, product_id, sku_ids_sorted)
+    reorder_product_media(product_id, final_order)
 
 
 # =========================
@@ -934,27 +1012,28 @@ def sync_images() -> SyncResponse:
             log.info("SKU %s trovato. Product=%s Variant=%s", sku, product_id, variant_id)
 
             items.sort(key=lambda x: (x["position"], x["filename"]))
-            newly_added_media_ids: List[str] = []
+            media_for_variant_in_order: List[str] = []
+            preferred_media_by_filename: Dict[str, str] = {}
 
             for item in items:
                 path_key = item["path_key"]
                 raw = ftp_read_file(item["directory"], item["filename"])
                 fingerprint = file_fingerprint(raw)
                 mime_type = mimetypes.guess_type(item["filename"])[0] or "image/jpeg"
-                alt = f"{sku} - {item['filename']}"
+                alt = build_expected_alt(sku, item["filename"])
 
                 existing_media_id, duplicate_media_ids = find_existing_media_and_duplicates(product_id, raw, alt)
                 if existing_media_id:
                     log.info("Immagine già presente sul prodotto. Riuso media %s", existing_media_id)
-                    newly_added_media_ids.append(existing_media_id)
-                    attach_media_to_variant(product_id, variant_id, existing_media_id)
-
                     if duplicate_media_ids:
                         log.info("Trovati duplicati da eliminare: %s", duplicate_media_ids)
                         delete_duplicate_product_media(product_id, duplicate_media_ids)
 
-                    archive_info = ftp_archive_file(item["directory"], item["filename"])
+                    attach_media_to_variant(product_id, variant_id, existing_media_id)
+                    media_for_variant_in_order.append(existing_media_id)
+                    preferred_media_by_filename[item["filename"]] = existing_media_id
 
+                    archive_info = ftp_archive_file(item["directory"], item["filename"])
                     state["files"][path_key] = {
                         "sku": sku,
                         "fingerprint": fingerprint,
@@ -983,7 +1062,6 @@ def sync_images() -> SyncResponse:
                 product_media_id = attach_media_to_product(product_id, cdn_url, alt)
                 invalidate_product_media_cache(product_id)
 
-                # Pulizia duplicati eventuali dopo il nuovo upload
                 keep_media_id, duplicate_media_ids = find_existing_media_and_duplicates(product_id, raw, alt)
                 final_media_id = keep_media_id or product_media_id
                 if duplicate_media_ids:
@@ -991,7 +1069,10 @@ def sync_images() -> SyncResponse:
                     if duplicate_media_ids:
                         delete_duplicate_product_media(product_id, duplicate_media_ids)
 
-                newly_added_media_ids.append(final_media_id)
+                attach_media_to_variant(product_id, variant_id, final_media_id)
+                media_for_variant_in_order.append(final_media_id)
+                preferred_media_by_filename[item["filename"]] = final_media_id
+
                 archive_info = ftp_archive_file(item["directory"], item["filename"])
                 uploaded += 1
 
@@ -1006,15 +1087,15 @@ def sync_images() -> SyncResponse:
                 }
                 save_state(state)
 
-            if newly_added_media_ids:
-                ordered_unique_media_ids = list(dict.fromkeys(newly_added_media_ids))
-                for media_id in ordered_unique_media_ids:
+            if media_for_variant_in_order:
+                unique_media_ids = list(dict.fromkeys(media_for_variant_in_order))
+                for media_id in unique_media_ids:
                     attach_media_to_variant(product_id, variant_id, media_id)
-                if len(ordered_unique_media_ids) > 1:
-                    try:
-                        reorder_product_media(product_id, ordered_unique_media_ids)
-                    except Exception as e:
-                        log.warning("Riordino media fallito per SKU %s: %s", sku, e)
+
+                try:
+                    reorder_full_product_gallery_for_sku(product_id, sku, preferred_media_by_filename)
+                except Exception as e:
+                    log.warning("Riordino/deduplica finale fallita per SKU %s: %s", sku, e)
 
         except Exception as exc:
             log.exception("Errore SKU %s: %s", sku, exc)
@@ -1040,7 +1121,6 @@ if app is not None:
     @app.get("/health")
     def health():
         return {"ok": True}
-
 
     @app.post("/sync", response_model=SyncResponse)
     def run_sync():
