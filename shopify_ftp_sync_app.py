@@ -1029,7 +1029,6 @@ def sync_images() -> SyncResponse:
                         log.info("Trovati duplicati da eliminare: %s", duplicate_media_ids)
                         delete_duplicate_product_media(product_id, duplicate_media_ids)
 
-                    attach_media_to_variant(product_id, variant_id, existing_media_id)
                     media_for_variant_in_order.append(existing_media_id)
                     preferred_media_by_filename[item["filename"]] = existing_media_id
 
